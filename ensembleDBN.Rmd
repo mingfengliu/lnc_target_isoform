@@ -1,0 +1,1611 @@
+---
+title: "ensembleDBN"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+#DBN all groups bootstrap results ensemble
+```{r}
+library(tidyverse)
+# 加载数据
+load("~/RNAseq/RNAseq_FULL_MODEL/combined time/DBN_results/DBN_Optimized_Results_HPC.RData")
+
+# 直接从valid_results提取数据
+all_edges_list <- lapply(valid_results, function(res) {
+  if(!is.null(res$bootstrap_stats) && nrow(res$bootstrap_stats) > 0){
+    stats <- res$bootstrap_stats
+    stats$group_id <- res$group_name
+    stats$lncRNA <- res$lnc_display_name 
+    return(stats)
+  } else {
+    return(NULL)
+  }
+})
+
+# 移除NULL结果
+all_edges_list <- all_edges_list[!sapply(all_edges_list, is.null)]
+
+cat("Processed", length(all_edges_list), "groups with bootstrap stats\n")
+
+# 合并大表格
+if(length(all_edges_list) > 0) {
+  raw_network_table <- do.call(rbind, all_edges_list)
+  cat("Raw table rows:", nrow(raw_network_table), "\n")
+  
+  # Ensemble Voting - 首先检查所有必需的列是否存在
+  cat("Performing Ensemble Voting...\n")
+  
+  # 检查列是否存在
+  required_cols <- c("lncRNA", "gene", "group_id", "bootstrap_frequency", "consensus_relationship")
+  missing_cols <- setdiff(required_cols, colnames(raw_network_table))
+  
+  if(length(missing_cols) > 0) {
+    stop(paste("Missing required columns:", paste(missing_cols, collapse = ", ")))
+  }
+  
+  final_network_table <- raw_network_table %>%
+    group_by(lncRNA, gene) %>%
+    summarise(
+      n_groups_positive = n_distinct(group_id),
+      avg_freq_when_found = mean(bootstrap_frequency),
+      max_group_freq = max(bootstrap_frequency),
+      final_relationship = names(sort(table(consensus_relationship), decreasing=TRUE))[1],
+      # 保留所有原始列的信息
+      all_group_ids = paste(unique(group_id), collapse = ";"),
+      all_bootstrap_freqs = paste(round(bootstrap_frequency, 3), collapse = ";"),
+      all_relationships = paste(unique(consensus_relationship), collapse = ";"),
+      .groups = 'drop'
+    ) %>%
+    # 计算置信等级
+    mutate(
+      Confidence_Tier = case_when(
+        n_groups_positive >= 20 & avg_freq_when_found >= 0.8 ~ "Gold (High Robustness)",
+        n_groups_positive >= 15 & avg_freq_when_found >= 0.7 ~ "Silver (Reproducible)",
+        n_groups_positive >= 10 & avg_freq_when_found >= 0.9 ~ "Bronze (Context-Specific)",
+        TRUE ~ "Discard"
+      )
+    ) %>%
+    # 只保留 Gold, Silver, Bronze
+    filter(Confidence_Tier != "Discard") %>%
+    arrange(desc(n_groups_positive))
+  
+  
+  # 直接计算并添加到现有的 final_network_table
+final_network_table <- final_network_table %>%
+  mutate(
+    n_groups_tested = sapply(strsplit(all_group_ids, ";"), length),  # 从all_group_ids计算测试组数
+    total_evidence_score = sapply(strsplit(all_bootstrap_freqs, ";"), function(x) {
+      sum(as.numeric(x))  # 从all_bootstrap_freqs计算总证据分数
+    }),
+    global_consistency_score = total_evidence_score / n_groups_tested  # 计算全局一致性分数
+  ) %>%
+  # 重新排序列，让新计算的列在一起
+  dplyr::select(lncRNA, gene, n_groups_positive, n_groups_tested, total_evidence_score, global_consistency_score,
+         avg_freq_when_found, max_group_freq, everything())
+
+# 查看计算结果
+cat("Global consistency score statistics:\n")
+cat("Min:", min(final_network_table$global_consistency_score, na.rm = TRUE), "\n")
+cat("Mean:", mean(final_network_table$global_consistency_score, na.rm = TRUE), "\n")
+cat("Max:", max(final_network_table$global_consistency_score, na.rm = TRUE), "\n")
+
+cat("\nTop 10 interactions by global consistency score:\n")
+top_consistent <- final_network_table %>%
+  arrange(desc(global_consistency_score)) %>%
+  head(10) %>%
+  dplyr::select(lncRNA, gene, n_groups_tested, total_evidence_score, global_consistency_score, Confidence_Tier)
+print(top_consistent)
+
+# 保存更新后的表格
+save(final_network_table, file = "Final_Robust_LncRNA_Network_Ensemble_HPC.RData")
+write.csv(final_network_table, "Final_Robust_LncRNA_Network_Ensemble_HPC.csv", row.names = FALSE)
+  
+  
+} else {
+  cat("No valid bootstrap statistics found in the results!\n")
+}
+
+final_network_table <- final_network_table %>%
+  mutate(Biological_Role = case_when(
+    # 1. 明确的下游靶点
+    final_relationship == "lnc_regulates_gene" ~ "Downstream Target",
+    
+    # 2. 明确的上游调节者
+    final_relationship == "gene_regulates_lnc" ~ "Upstream Modulator",
+    
+    # 3. 正相关 -> 升级为“功能协作者”
+    final_relationship == "associated_pos" ~ "Synergistic Partner",
+    
+    # 4. 负相关 -> 升级为“竞争性/抑制性伴侣”
+    final_relationship == "associated_neg" ~ "Repressive Partner",
+    
+    TRUE ~ "Unknown"
+  ))
+
+print(table(final_network_table$Confidence_Tier))
+cat("Aggregation completed!\n")
+
+# --- 提取目标基因并保留所有信息 ---
+cat("\n=== Extracting Top Genes with Complete Information ===\n")
+
+# 步骤 1: 筛选目标基因（保留所有置信等级）
+cat("Filtering for Gold/Silver/Bronze targets...\n")
+targets_to_fetch <- final_network_table %>%
+  filter(Confidence_Tier == "Gold (High Robustness)", avg_freq_when_found == 1)
+
+# 确保有目标
+if(nrow(targets_to_fetch) == 0) stop("No targets found! Check filtering.")
+cat("Total targets to fetch:", nrow(targets_to_fetch), "\n")
+
+# 检查 targets_to_fetch 的列
+cat("Columns in targets_to_fetch:", paste(colnames(targets_to_fetch), collapse = ", "), "\n")
+
+# 步骤 2: 构建索引
+cat("Building lookup index...\n")
+gene_lookup_idx <- list()
+idx_count <- 0
+
+total_groups <- length(valid_results)
+pb_idx <- txtProgressBar(min = 0, max = total_groups, style = 3)
+
+for(i in 1:total_groups) {
+  res <- valid_results[[i]]
+  
+  if(!is.null(res) && !is.null(res$integrated_results$temporal_evidence)) {
+    lnc <- res$lnc_display_name
+    evidence_list <- res$integrated_results$temporal_evidence
+    genes_in_this_group <- names(evidence_list)
+    
+    for(g in genes_in_this_group) {
+      key <- paste0(lnc, "|", g)
+      if(is.null(gene_lookup_idx[[key]])) {
+        gene_lookup_idx[[key]] <- i
+        idx_count <- idx_count + 1
+      }
+    }
+  }
+  if(i %% 100 == 0) setTxtProgressBar(pb_idx, i)
+}
+close(pb_idx)
+cat("\nIndex built with", idx_count, "entries.\n")
+
+# 步骤 3: 提取 Lag 数据并保留所有原始信息
+final_ranking_list <- list()
+match_count <- 0
+
+cat("Extracting Lag stats with complete information...\n")
+pb_ext <- txtProgressBar(min = 0, max = nrow(targets_to_fetch), style = 3)
+
+for(k in 1:nrow(targets_to_fetch)) {
+  
+  curr_lnc <- targets_to_fetch$lncRNA[k]
+  curr_gene <- targets_to_fetch$gene[k]
+  
+  key <- paste0(curr_lnc, "|", curr_gene)
+  grp_idx <- gene_lookup_idx[[key]]
+  
+  if(!is.null(grp_idx)) {
+    res <- valid_results[[grp_idx]]
+    evidence <- res$integrated_results$temporal_evidence[[curr_gene]]
+    
+    if(!is.null(evidence) && !is.null(evidence$lag)) {
+      
+      # 安全地获取所有列的值
+      row_data <- data.frame(
+        # 基本信息
+        lncRNA = curr_lnc,
+        gene = curr_gene,
+        
+        # 统计信息
+        n_groups_positive = targets_to_fetch$n_groups_positive[k],
+        avg_freq_when_found = targets_to_fetch$avg_freq_when_found[k],
+        max_group_freq = targets_to_fetch$max_group_freq[k],
+        final_relationship = targets_to_fetch$final_relationship[k],
+        
+        # 分组信息（安全获取）
+        all_group_ids = if("all_group_ids" %in% colnames(targets_to_fetch)) targets_to_fetch$all_group_ids[k] else NA,
+        all_bootstrap_freqs = if("all_bootstrap_freqs" %in% colnames(targets_to_fetch)) targets_to_fetch$all_bootstrap_freqs[k] else NA,
+        all_relationships = if("all_relationships" %in% colnames(targets_to_fetch)) targets_to_fetch$all_relationships[k] else NA,
+        
+        # 置信等级
+        Confidence_Tier = targets_to_fetch$Confidence_Tier[k],
+        Biological_Role = targets_to_fetch$Biological_Role[k],
+        
+        # Lag 统计信息
+        best_lag = evidence$lag$best_lag,
+        lag_cor = evidence$lag$max_correlation,
+        lag_p = evidence$lag$pvalue,
+        
+        # 其他可能有用的信息
+        group_id_matched = res$group_name,
+        
+        stringsAsFactors = FALSE,
+        check.names = FALSE
+      )
+      
+      final_ranking_list[[length(final_ranking_list) + 1]] <- row_data
+      match_count <- match_count + 1
+    }
+  }
+  setTxtProgressBar(pb_ext, k)
+}
+close(pb_ext)
+
+cat("\nExtraction matched:", match_count, "genes.\n")
+
+# 步骤 4: 合并与保存
+if(length(final_ranking_list) > 0) {
+  all_lnc_top_targets <- do.call(rbind, final_ranking_list)
+  
+  # 排序：置信等级 -> P值 -> 相关性
+  if("Confidence_Tier" %in% colnames(all_lnc_top_targets)) {
+    all_lnc_top_targets <- all_lnc_top_targets %>% 
+      arrange(desc(Confidence_Tier), lag_p, desc(abs(lag_cor)))
+  } else {
+    all_lnc_top_targets <- all_lnc_top_targets %>% arrange(lag_p)
+  }
+  
+  # 保存完整结果
+  save(all_lnc_top_targets, file = "All_LncRNAs_Top_Targets_Complete_Info.RData")
+  write.csv(all_lnc_top_targets, "All_LncRNAs_Top_Targets_Complete_Info.csv", row.names = FALSE)
+  
+  cat("Success! Complete results saved to:\n")
+  cat("- All_LncRNAs_Top_Targets_Complete_Info.RData\n")
+  cat("- All_LncRNAs_Top_Targets_Complete_Info.csv\n")
+  
+  # 输出统计信息
+  cat("\n=== Final Results Summary ===\n")
+  cat("Total interactions:", nrow(all_lnc_top_targets), "\n")
+  if("Confidence_Tier" %in% colnames(all_lnc_top_targets)) {
+    cat("Confidence Tier distribution:\n")
+    print(table(all_lnc_top_targets$Confidence_Tier))
+  }
+  cat("\nTop 10 interactions:\n")
+  print(head(all_lnc_top_targets, 10))
+  
+} else {
+  stop("Final list is empty. Please check if genes in 'final_network_table' actually exist in 'valid_results'.")
+}
+```
+
+#degree
+```{r}
+load("~/RNAseq/RNAseq_FULL_MODEL/combined time/results/sig_genes_21_to_28.RData")
+dox_response_gene <- unique(sig_genes_21_to_28$gene_name)
+# 计算每个基因的“受欢迎程度” (Degree)
+gene_degree <- all_lnc_top_targets %>%
+  group_by(gene) %>%
+  summarise(
+    n_lncRNAs = n_distinct(lncRNA),
+    lncRNAs_list = paste(unique(lncRNA), collapse = ", ")
+  ) %>%
+  arrange(desc(n_lncRNAs))
+
+# 查看 Top 10 "Super-Hubs"
+print(head(gene_degree, 20))
+
+all_lnc_top_targets <- all_lnc_top_targets %>%
+  left_join(gene_degree, by = "gene")
+
+# 可视化：度分布图
+ggplot(gene_degree, aes(x = n_lncRNAs)) +
+  geom_bar(fill = "#377EB8") +
+  theme_minimal() +
+  labs(
+    title = "Distribution of Combinatorial Regulation",
+    x = "Number of LncRNAs Regulating a Gene",
+    y = "Count of Genes"
+  ) +
+  scale_x_continuous(breaks = 1:18)
+
+ggsave("~/RNAseq/RNAseq_FULL_MODEL/combined time/DBN_results/figures/Distribution of Combinatorial Regulation.pdf", 
+       width = 5, height = 5, limitsize = FALSE)
+
+
+# 确保 all_lnc_top_targets 里已经有了 n_lncRNAs 列 (基于你之前的 left_join)
+# 如果没有，重新运行一遍 degree 计算：
+if(!"n_lncRNAs" %in% colnames(all_lnc_top_targets)) {
+  gene_degree <- all_lnc_top_targets %>%
+    group_by(gene) %>%
+    mutate(n_lncRNAs = n_distinct(lncRNA)) %>%
+    ungroup()
+  
+  all_lnc_top_targets <- gene_degree
+}
+
+# 分类并统计
+plot_data <- all_lnc_top_targets %>%
+  # 定义分类：Degree=1 为 Specific，其他为 Shared
+  mutate(Target_Category = ifelse(n_lncRNAs == 1, 
+                                  "Specific Targets (Degree=1)", 
+                                  "Shared Targets (Degree>1)")) %>%
+  # 统计每个 lncRNA 在每个分类下的基因数量
+  group_by(lncRNA, Target_Category) %>%
+  summarise(Count = n(), .groups = 'drop')
+
+
+# 为了图表好看，我们按照 "Specific Targets" 的数量从多到少排序
+# 这样左边是“专家型”，右边是“通用型”
+
+order_df <- plot_data %>%
+  filter(Target_Category == "Specific Targets (Degree=1)") %>%
+  arrange(desc(Count))
+
+lnc_levels <- order_df$lncRNA
+
+# 把那些没有 Specific Target 的 lncRNA (如果有的话) 补在最后
+remaining_lncs <- setdiff(unique(plot_data$lncRNA), lnc_levels)
+lnc_levels <- c(lnc_levels, remaining_lncs)
+
+# 应用排序
+plot_data$lncRNA <- factor(plot_data$lncRNA, levels = lnc_levels)
+# 调整 Category 的因子顺序，让 Specific 在下面（或上面），看个人喜好
+plot_data$Target_Category <- factor(plot_data$Target_Category, 
+                                    levels = c("Shared Targets (Degree>1)", "Specific Targets (Degree=1)"))
+
+
+
+p <- ggplot(plot_data, aes(x = lncRNA, y = Count, fill = Target_Category)) +
+  
+  # 绘制堆叠柱状图
+  geom_bar(stat = "identity", width = 0.7, color = "black", size = 0.2) +
+  
+  # 添加数字标签 (可选，如果数字太小挤在一起就去掉)
+  geom_text(aes(label = Count), 
+            position = position_stack(vjust = 0.5), 
+            size = 3, color = "white", fontface = "bold") +
+  
+  # 配色方案 (红蓝配色，对比强烈)
+  # Specific 用醒目的颜色(红/深色)，Shared 用基础色(灰/浅色)
+  scale_fill_manual(values = c("Specific Targets (Degree=1)" = "#E64B35", # NPG Red
+                               "Shared Targets (Degree>1)" = "#8491B4")) + # NPG Blue/Grey
+  
+  # 坐标轴与标题
+  labs(title = "Regulatory Architecture: Specificity vs. Redundancy",
+       subtitle = "Number of unique (degree=1) vs. shared (degree>1) targets per lncRNA",
+       x = NULL,
+       y = "Number of Target Genes",
+       fill = "Target Type") +
+  
+  # 主题优化
+  theme_classic(base_size = 14) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, color = "black", face = "bold"),
+    axis.text.y = element_text(color = "black"),
+    legend.position = "top",
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5, color = "grey30")
+  )
+
+
+ggsave("Fig_Target_Specificity_StackedBar.pdf", p, width = 10, height = 6)
+print(p)
+```
+
+#superhub gene heatmap
+```{r}
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(igraph)
+library(ggraph)
+super_hubs <- gene_degree %>%
+  filter(n_lncRNAs >= 9) %>%
+  arrange(desc(n_lncRNAs))
+
+print(super_hubs)
+
+ids <- bitr(super_hubs$gene, fromType="SYMBOL", toType="GENENAME", OrgDb="org.Hs.eg.db")
+print(ids)
+
+super_hubs <- super_hubs %>%
+  left_join(ids, by = c("gene" = "SYMBOL"))
+
+# 1. 筛选 super hub 基因相关的互作
+super_hub_genes <- super_hubs$gene
+# 1. 准备矩阵数据
+heatmap_data <- all_lnc_top_targets %>%
+  filter(gene %in% super_hub_genes) %>%
+  dplyr::select(lncRNA, gene, lag_cor)
+
+# 2. 获取基因注释用于Y轴标签 (可选，如果基因名太长就只用 Symbol)
+gene_labels <- super_hubs %>%
+  dplyr::select(gene, GENENAME) %>%
+  distinct()
+
+# 3. 绘制热图
+# 如果想让热图自动聚类（让相似调控模式的基因靠在一起），可以使用 pheatmap 或 ComplexHeatmap
+# 下面是 ggplot 的简单聚类实现：
+# 计算聚类顺序
+mat <- reshape2::acast(heatmap_data, gene ~ lncRNA, value.var = "lag_cor", fill = 0)
+ord_gene <- hclust(dist(mat))$order
+ord_lnc <- hclust(dist(t(mat)))$order
+
+# 重排序 factor
+heatmap_data$gene <- factor(heatmap_data$gene, levels = rownames(mat)[ord_gene])
+heatmap_data$lncRNA <- factor(heatmap_data$lncRNA, levels = colnames(mat)[ord_lnc])
+
+# 重新绘图（带聚类顺序）
+p_heatmap_clustered <- ggplot(heatmap_data, aes(x = lncRNA, y = gene, fill = lag_cor)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "#2166AC", mid = "#F7F7F7", high = "#B2182B") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Clustered Regulation Map of Super Hubs")
+
+ggsave("Super_Hubs_Heatmap.pdf", p_heatmap_clustered, width = 10, height = max(8, length(super_hub_genes)*0.15))
+
+library(ggraph)
+library(igraph)
+
+
+super_hub_network <- all_lnc_top_targets %>%
+  filter(gene %in% super_hub_genes) %>%
+  # 为每个super hub基因选择相关性最强的8个lncRNA
+  group_by(gene) %>%
+  slice_max(order_by = abs(lag_cor), n = 8) %>%
+  ungroup()
+
+edges_super <- data.frame(
+  from = super_hub_network$lncRNA,
+  to = super_hub_network$gene,
+  weight = abs(super_hub_network$lag_cor),
+  correlation = super_hub_network$lag_cor,
+  p_value = super_hub_network$lag_p,
+  stringsAsFactors = FALSE
+)
+
+cat("Edges data frame created with", nrow(edges_super), "rows\n")
+
+nodes_super <- data.frame(
+  name = unique(c(edges_super$from, edges_super$to)),
+  stringsAsFactors = FALSE
+)
+
+# 添加节点类型
+nodes_super$type <- ifelse(nodes_super$name %in% edges_super$from, "LncRNA",
+                          ifelse(nodes_super$name %in% super_hub_genes, "Super_Hub_Gene", "Gene"))
+
+# 计算节点度
+nodes_super$degree <- sapply(nodes_super$name, function(x) {
+  sum(edges_super$from == x) + sum(edges_super$to == x)
+})
+# 使用你之前处理好的 edges_super 和 nodes_super
+
+# 1. 强制定义布局坐标 (手动设置)
+# 分离 lncRNA 和 Gene
+lnc_nodes <- nodes_super$name[nodes_super$type == "LncRNA"]
+gene_nodes <- nodes_super$name[nodes_super$type != "LncRNA"]
+
+# 创建坐标数据框
+layout_df <- data.frame(name = c(lnc_nodes, gene_nodes))
+
+# 设置 Y 轴：LncRNA 在顶部 (y=1)，Gene 在底部 (y=0)
+layout_df$y <- ifelse(layout_df$name %in% lnc_nodes, 1, 0)
+
+# 设置 X 轴：均匀分布
+layout_df$x <- 0
+layout_df$x[layout_df$y == 1] <- seq(0, 100, length.out = length(lnc_nodes))
+layout_df$x[layout_df$y == 0] <- seq(0, 100, length.out = length(gene_nodes))
+
+# 2. 创建图对象
+g_bipartite <- graph_from_data_frame(edges_super, vertices = nodes_super)
+
+# 3. 绘图 (使用自定义布局)
+create_layout(g_bipartite, layout = "manual", x = layout_df$x, y = layout_df$y) %>%
+  ggraph() +
+  # 连线：使用曲线，根据相关性着色
+  geom_edge_diagonal(aes(color = correlation, alpha = abs(correlation)), width = 0.5) +
+  scale_edge_color_gradient2(low = "blue", mid = "grey90", high = "red") +
+  
+  # 节点：LncRNA
+  geom_node_point(aes(filter = type == "LncRNA"), size = 5, color = "#E41A1C") +
+  geom_node_text(aes(label = name, filter = type == "LncRNA"), 
+                 nudge_y = 0.1, fontface = "bold", size = 4) +
+  
+  # 节点：Genes
+  geom_node_point(aes(filter = type != "LncRNA", size = degree), color = "#377EB8") +
+  geom_node_text(aes(label = name, filter = type != "LncRNA"), 
+                 angle = 90, hjust = 1, nudge_y = -0.05, size = 3) +
+  
+  # 设置画布范围，防止标签被切
+  expand_limits(y = c(-0.5, 1.5)) +
+  theme_void() +
+  labs(title = "Bipartite Regulatory Architecture", 
+       subtitle = "Top: LncRNAs | Bottom: Super Hub Genes")
+
+ggsave("Super_Hubs_Bipartite.pdf", width = 12, height = 8)
+
+```
+
+#DBN 结果是特异的还是共线性
+```{r}
+library(dplyr)
+library(ggplot2)
+library(ggpubr)
+library(tidyr)
+library(ggrepel)
+
+# ==============================================================================
+# 1. 数据准备
+# ==============================================================================
+
+# A. 确保我们有 206 个 Dox 基因的列表
+# 假设你的 206 个基因列表叫 dox_response_gene
+if(!exists("dox_response_gene")) {
+  stop("请提供 dox_response_gene 向量 (206个基因名)")
+}
+
+# B. 确定哪些基因最终被纳入了网络 (High Confidence Targets)
+# 假设 all_lnc_top_targets 是你最终过滤好的表
+network_genes <- unique(all_lnc_top_targets$gene)
+
+# C. 计算这 206 个基因在原始分析中的最高 Frequency
+# (我们需要回到 raw_network_table 找那些被淘汰基因的“真实得分”)
+# 如果基因在 raw_network_table 里没出现过，说明 Frequency = 0
+
+dox_specificity_data <- data.frame(gene = dox_response_gene) %>%
+  # 标记是否被最终纳入
+  mutate(Status = ifelse(gene %in% network_genes, 
+                         "LncRNA-Network Targets\n(Included)", 
+                         "LncRNA-Independent\n(Excluded)"))
+
+# 从 raw_network_table 中提取每个基因的最高 Frequency
+raw_freq_stats <- raw_network_table %>%
+  filter(gene %in% dox_response_gene) %>%
+  group_by(gene) %>%
+  summarise(
+    Bootstrap_Freq = mean(bootstrap_frequency), # 取它在所有组里最高的那个频率
+    .groups = 'drop'
+  )
+
+# 合并数据 (没找到的基因 Freq 设为 0)
+dox_specificity_data <- dox_specificity_data %>%
+  left_join(raw_freq_stats, by = "gene") %>%
+  mutate(Bootstrap_Freq = ifelse(is.na(Bootstrap_Freq), 0, Bootstrap_Freq))
+
+# ==============================================================================
+# 2. 绘图 A: 数量分布 (Donut Chart or Bar Chart)
+# ==============================================================================
+
+count_data <- dox_specificity_data %>%
+  group_by(Status) %>%
+  summarise(Count = n()) %>%
+  mutate(Percentage = Count / sum(Count) * 100)
+
+p1 <- ggplot(count_data, aes(x = "", y = Count, fill = Status)) +
+  geom_bar(stat = "identity", width = 1, color = "white") +
+  coord_polar("y", start = 0) +
+  theme_void() +
+  scale_fill_manual(values = c("LncRNA-Independent\n(Excluded)" = "grey70", 
+                               "LncRNA-Network Targets\n(Included)" = "#E41A1C")) +
+  geom_text(aes(label = paste0(Count, "\n(", round(Percentage, 1), "%)")), 
+            position = position_stack(vjust = 0.5), color = "white", fontface = "bold", size = 5) +
+  labs(title = "Selectivity of LncRNA Network",
+       subtitle = "Proportion of Dox-sig genes regulated by lncRNAs") +
+  theme(legend.position = "bottom",
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5))
+
+# ==============================================================================
+# 3. 绘图 B: 频率分布对比 (Boxplot with Jitter)
+# ==============================================================================
+
+# 特别标记 NANOG 或 POU5F1
+highlight_genes <- c("NANOG", "POU5F1", "SOX2") # 根据你的基因名修改
+label_data <- dox_specificity_data %>% filter(gene %in% highlight_genes)
+
+# 计算 P 值
+stat_res <- wilcox.test(Bootstrap_Freq ~ Status, data = dox_specificity_data)
+p_val_label <- paste0("Wilcoxon, 4.848711e-10")
+
+p2 <- ggplot(dox_specificity_data, aes(x = Status, y = Bootstrap_Freq, fill = Status)) +
+  # 箱线图
+  geom_boxplot(width = 0.6, alpha = 0.8, outlier.shape = 21, outlier.size = 1.5, outlier.fill = "grey") +
+  # 抖动点图 (展示真实分布)
+#  geom_jitter(width = 0.2, alpha = 0.5, size = 1.5, color = "black") +
+  
+  # 标记 NANOG
+  geom_point(data = label_data, color = "blue", size = 3, shape = 18) +
+  geom_label_repel(data = label_data, aes(label = gene), 
+                   color = "blue", fontface = "bold", nudge_x = 0.3, box.padding = 0.5) +
+  
+  # 配色
+  scale_fill_manual(values = c("LncRNA-Independent\n(Excluded)" = "grey70", 
+                               "LncRNA-Network Targets\n(Included)" = "#E41A1C")) +
+  
+  # 添加统计显著性
+  annotate("text", x = 1.5, y = 1.05, label = p_val_label, size = 5, fontface = "bold") +
+  
+  # 坐标轴和标题
+  labs(title = "Algorithmic Discrimination Power",
+       subtitle = "Included targets show deterministic causality vs. Excluded noise",
+       y = "Max Bootstrap Frequency (Robustness)",
+       x = NULL) +
+  theme_classic(base_size = 14) +
+  theme(legend.position = "none",
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        axis.text.x = element_text(face = "bold"))
+
+# ==============================================================================
+# 4. 拼图与保存
+# ==============================================================================
+
+combined_plot <- ggarrange(p1, p2, ncol = 2, labels = c("A", "B"), widths = c(1, 1.2))
+
+ggsave("Fig_Specificity_Check.pdf", combined_plot, width = 12, height = 6)
+
+print(combined_plot)
+
+# 1. 标记是否属于 209 核心集
+all_lnc_top_targets <- all_lnc_top_targets %>%
+  mutate(Is_Core_Response = gene %in% dox_response_gene)
+stat_test <- wilcox.test(lag_p ~ Is_Core_Response, data = all_lnc_top_targets)
+
+print(stat_test$p.value)
+
+plot_data <- all_lnc_top_targets %>%
+  mutate(Group_Label = ifelse(Is_Core_Response, 
+                              "Core Stress Module\n(209 Genes)", 
+                              "Peripheral Targets\n(Non-Core)")) %>%
+  # 确保 Core 在右边或者左边，这里让 Core 在右边突出显示
+  mutate(Group_Label = factor(Group_Label, levels = c("Peripheral Targets\n(Non-Core)", "Core Stress Module\n(209 Genes)")))
+
+# 2. 计算 P 值标签位置 (放在 Y 轴最大值上方一点点)
+max_y <- max(-log10(plot_data$lag_p), na.rm = TRUE)
+p_val_text <- "Wilcoxon, P < 3.099219e-50"
+
+# 3. 绘图
+p <- ggplot(plot_data, aes(x = Group_Label, y = -log10(lag_p), fill = Group_Label)) +
+  
+  # 箱线图：去掉异常值点，因为点太多会很乱，我们后面可以用 jitter 或者只保留箱子
+  geom_boxplot(width = 0.6, alpha = 0.8, outlier.shape = 21, outlier.size = 1.5, outlier.fill = "grey") +
+  
+  # 添加 P 值标注线和文本
+  annotate("segment", x = 1, xend = 2, y = max_y + 2, yend = max_y + 2, size = 0.8) + # 横线
+  annotate("text", x = 1.5, y = max_y + 5, label = p_val_text, size = 5, fontface = "bold") +
+  
+  # 配色：Cell Genomics 风格 (Core 用醒目的颜色，Peripheral 用灰色/淡色)
+  scale_fill_manual(values = c("Peripheral Targets\n(Non-Core)" = "#8da0cb", 
+                               "Core Stress Module\n(209 Genes)" = "#fc8d62")) +
+  
+  # 坐标轴和标题优化
+  labs(
+    title = "Validation of Regulatory Lag Significance",
+    subtitle = "Core stress genes exhibit stronger temporal dependency on lncRNAs",
+    y = expression(bold(Temporal~Lag~Significance~~(-log[10]~italic(P)-value))), # 使用数学表达式
+    x = NULL # 不需要 X 轴标题，因为 X 轴标签已经很清楚了
+  ) +
+  
+  # 主题美化
+  theme_classic(base_size = 14) +
+  theme(
+    legend.position = "none", # 不需要图例，因为 X 轴标签已经说明了
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5, color = "grey30"),
+    axis.text.x = element_text(face = "bold", color = "black", size = 12),
+    axis.text.y = element_text(color = "black")
+  )
+
+# 4. 保存
+ggsave("~/RNAseq/RNAseq_FULL_MODEL/combined time/DBN_results/figures/Fig_S_Core_Lag_Validation.pdf", 
+       plot = p, width = 6, height = 6) # 稍微调大一点
+
+# 预览
+print(p)
+
+
+#############每个lncRNA相互作用基因中有多少是DOX 209
+# ==============================================================================
+# 1. 数据准备
+# ==============================================================================
+
+# 确保 dox_response_gene 存在
+if(!exists("dox_response_gene")) {
+  # 如果你之前的变量名不一样，请在这里替换，或者重新加载那206个基因名
+  # dox_response_gene <- ... 
+  stop("请先定义 dox_response_gene (包含206个核心基因名的向量)")
+}
+
+# 标记每个靶基因是否属于 Dox Core
+plot_data <- all_lnc_top_targets %>%
+  mutate(Target_Type = ifelse(gene %in% dox_response_gene, 
+                              "Core Dox-Responsive Genes", 
+                              "Extended Targets (Non-Core)")) %>%
+  group_by(lncRNA, Target_Type) %>%
+  summarise(Count = n(), .groups = 'drop')
+
+# ==============================================================================
+# 2. 计算比例并排序 (关键步骤)
+# ==============================================================================
+
+# 计算每个 lncRNA 中 Dox Core 的占比，用于排序
+order_stats <- plot_data %>%
+  group_by(lncRNA) %>%
+  mutate(Total = sum(Count)) %>%
+  filter(Target_Type == "Core Dox-Responsive Genes") %>%
+  mutate(Percentage = Count / Total * 100) %>%
+  arrange(desc(Percentage)) # 按 Dox 基因浓度从高到低排序
+
+# 应用排序
+lnc_levels <- order_stats$lncRNA
+# 如果有 lncRNA 一个 Dox 靶点都没有，补在最后
+remaining <- setdiff(unique(plot_data$lncRNA), lnc_levels)
+lnc_levels <- c(lnc_levels, remaining)
+
+plot_data$lncRNA <- factor(plot_data$lncRNA, levels = lnc_levels)
+# 设定因子顺序，让 Core 在柱状图底部
+plot_data$Target_Type <- factor(plot_data$Target_Type, 
+                                levels = c("Extended Targets (Non-Core)", "Core Dox-Responsive Genes"))
+
+# ==============================================================================
+# 3. 绘图 (Stacked Bar Plot)
+# ==============================================================================
+
+p <- ggplot(plot_data, aes(x = lncRNA, y = Count, fill = Target_Type)) +
+  
+  # 柱状图
+  geom_bar(stat = "identity", width = 0.7, color = "black", size = 0.2) +
+  
+  # 添加数字标签 (数量 + 百分比)
+  # 这是一个很好的细节，让读者一眼看到浓度
+  geom_text(aes(label = Count), 
+            position = position_stack(vjust = 0.5), 
+            size = 3, color = "white", fontface = "bold") +
+  
+  # 配色：Core 用醒目的红色，Extended 用灰色
+  scale_fill_manual(values = c("Core Dox-Responsive Genes" = "#E64B35", # NPG Red
+                               "Extended Targets (Non-Core)" = "#8491B4")) + # NPG Grey
+  
+  # 坐标轴
+  labs(title = "Network Composition: Core Response vs. Functional Spreading",
+       subtitle = "Proportion of Dox-signature genes (206 set) within each lncRNA's regulon",
+       x = NULL,
+       y = "Number of Target Genes",
+       fill = "Target Classification") +
+  
+  # 主题
+  theme_classic(base_size = 14) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, color = "black", face = "bold"),
+    axis.text.y = element_text(color = "black"),
+    legend.position = "top",
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5, color = "grey30")
+  )
+
+# ==============================================================================
+# 4. 保存
+# ==============================================================================
+ggsave("Fig_Dox_Target_Proportion.pdf", p, width = 10, height = 6)
+print(p)
+```
+
+#Regulatory Robustness Distribution
+```{r}
+p_violin <- ggplot(final_network_table, aes(x = lncRNA, y = global_consistency_score, fill = lncRNA)) +
+  geom_violin(trim = FALSE, alpha = 0.6, scale = "width") +
+  geom_boxplot(width = 0.1, fill = "white", outlier.shape = NA, alpha = 0.8) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, face = "bold"),
+    legend.position = "none",
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  ) +
+  labs(
+    y = "Global Consistency Score (Sum of Frequencies/Group Number)", 
+    title = "Regulatory Robustness Distribution",
+    subtitle = "Higher score = More consistent regulation across feature subspaces"
+  )
+
+print(p_violin)
+ggsave("Fig_LncRNA_Robustness_Violin.pdf", p_violin, width = 8, height = 5)
+```
+
+#specific interaction of each lnc
+```{r}
+specific_targets <- all_lnc_top_targets %>%
+  # 1. 按基因分组，计算每个基因被多少个 lncRNA 调控
+  group_by(gene) %>%
+  mutate(degree = n_distinct(lncRNA)) %>%
+  ungroup() %>%
+  
+  # 2. 直接筛选 Degree < 3 的行
+  filter(degree > 0) %>%
+  
+  # 3. 选出你需要的列 (使用 dplyr::select 防止冲突)
+  dplyr::select(lncRNA, gene, degree)
+
+# === 检查结果 ===
+cat("筛选出的特异性互作数量:", nrow(specific_targets), "\n")
+print(head(specific_targets))
+
+# === 统计每个 lncRNA 拥有多少特异性靶点 ===
+lnc_specificity_count <- specific_targets %>%
+  group_by(lncRNA) %>%
+  summarise(n_specific_genes = n()) %>%
+  arrange(desc(n_specific_genes))
+
+print(lnc_specificity_count)
+
+# 1. 准备数据列表
+# 只分析至少有 5 个特异基因的 lncRNA，否则富集不出结果
+valid_lncs <- lnc_specificity_count %>% filter(n_specific_genes >= 5) %>% pull(lncRNA)
+
+specific_gene_list <- split(specific_targets$gene, specific_targets$lncRNA)
+specific_gene_list <- specific_gene_list[valid_lncs]
+
+# 2. 循环做 GO 富集
+compare_cluster_res <- compareCluster(
+  geneClusters = specific_gene_list,
+  fun = "enrichGO",
+  keyType = "SYMBOL",
+  OrgDb = org.Hs.eg.db,
+  ont = "BP",           # 生物学过程
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05,
+  qvalueCutoff = 0.2
+)
+
+# 3. 保存结果
+save(compare_cluster_res, file = "LncRNA_Specific_Function_GO.RData")
+
+# 绘制比较气泡图
+# showCategory=3 表示每个 lncRNA 展示前 3 个最显著的通路
+p_dot <- dotplot(compare_cluster_res, showCategory = 3) + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Functional of LncRNAs",
+       subtitle = "GO Enrichment of LncRNA All Interact Genes")
+
+ggsave("Fig_LncRNA_Functional.pdf", p_dot, width = 14, height = 12)
+
+print(p_dot)
+
+
+library(enrichR)
+library(dplyr)
+library(ggplot2)
+library(stringr)
+
+# 1. 准备数据：只分析至少有 5 个特异基因的 lncRNA
+# 假设 specific_targets 是你之前生成的表格 (lncRNA, gene, degree)
+lncs_to_analyze <- lnc_specificity_count %>% 
+  filter(n_specific_genes >= 5) %>% 
+  pull(lncRNA)
+
+specific_gene_list <- split(specific_targets$gene, specific_targets$lncRNA)
+specific_gene_list <- specific_gene_list[lncs_to_analyze]
+
+# 2. 定义要查询的数据库组合 (组合拳)
+dbs <- c(
+#  "KEGG_2021_Human",                   # 通路
+  "Reactome_2022",                     # 详细通路
+  "MSigDB_Hallmark_2020",              # 核心生物学状态 (最容易出结果)
+  "GO_Biological_Process_2025"         # 再次尝试 GO
+#  "ChEA_2022",
+#  "HDSigDB_Human_2021",
+#  "TF_Perturbations_Followed_by_Expression"                                   # 转录因子机制
+)
+
+# 3. 循环分析
+combined_enrichment <- data.frame()
+
+cat("Starting multi-database enrichment...\n")
+# 连接 Enrichr (需要联网)
+if(length(dbs) > 0) {
+    for(lnc in names(specific_gene_list)) {
+      genes <- specific_gene_list[[lnc]]
+      
+      tryCatch({
+        enriched <- enrichr(genes, dbs)
+        
+        for(db in dbs) {
+          res <- enriched[[db]]
+          # 稍微放宽一点标准，P value < 0.1 也可以先看看，或者严格 < 0.05
+          sig_res <- res %>% filter(Adjusted.P.value < 0.05) 
+          
+          if(nrow(sig_res) > 0) {
+            # 取最显著的前 3 个
+            top_terms <- sig_res %>% slice_head(n = 5) %>%
+              mutate(LncRNA = lnc, Database = db)
+            
+            combined_enrichment <- rbind(combined_enrichment, top_terms)
+          }
+        }
+      }, error = function(e) {
+        cat("Error analyzing", lnc, ":", e$message, "\n")
+      })
+      cat(".")
+    }
+}
+cat("\nDone!\n")
+
+# 4. 数据清洗与美化
+if(nrow(combined_enrichment) > 0) {
+  
+  plot_data <- combined_enrichment %>%
+    # 清洗 Term 名字 (去掉 (GO:xxxx) 这种后缀)
+    mutate(Term = str_remove(Term, " \\(GO:.*\\)")) %>%
+    mutate(Term = str_remove(Term, " R-HSA.*")) %>% 
+    # 计算 -log10 P
+    mutate(LogP = -log10(Adjusted.P.value)) %>%
+    # 截断太长的名字
+    mutate(Term_Short = str_trunc(Term, 60))
+  
+  # 5. 可视化：分面气泡图
+  # 我们按数据库分面，这样可以看出不同维度的富集
+  p <- ggplot(plot_data, aes(x = LncRNA, y = Term_Short, size = LogP, color = Database)) +
+    geom_point(alpha = 0.8) +
+    facet_grid(Database ~ ., scales = "free_y", space = "free_y") +
+    scale_size_continuous(range = c(3, 8), name = "-log10(Adj.P)") +
+    theme_bw() +
+    labs(title = "Multi-dimensional Functional Specificity",
+         x = NULL, y = NULL) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1, face = "bold"),
+   #   strip.text.y = element_text(angle = 0, face = "bold"),
+      panel.grid.minor = element_blank()
+    )
+  
+  # 保存
+  ggsave("Fig_LncRNA_Multi_Enrichment.pdf", p, width = 8, height = 10) # 长一点，因为条目多
+  print(p)
+  
+} else {
+  cat("No significant enrichment found even with multiple databases.\n")
+}
+```
+
+```{r}
+library(dplyr)
+library(enrichR)
+library(ggplot2)
+library(stringr)
+
+# 计算 Degree
+gene_degree_info <- all_lnc_top_targets %>%
+  group_by(gene) %>%
+  mutate(degree = n_distinct(lncRNA)) %>%
+  ungroup()
+
+# A. 提取核心 (Global Core, >= 5)
+core_genes <- gene_degree_info %>%
+  filter(degree >= 5) %>%
+  pull(gene) %>%
+  unique()
+
+# B. 提取非核心 (Non-Core, < 5)
+# 这里包含了 Degree 1, 2, 3, 4
+non_core_data <- gene_degree_info %>%
+  filter(degree ==1)
+
+# 关键步骤：构建分析列表
+# 对于 Degree 2-4 的基因，它会出现在多个 lncRNA 的列表中，这是正确的
+analysis_list <- split(non_core_data$gene, non_core_data$lncRNA)
+
+# 把 Core 加进去
+analysis_list[["CONSENSUS_CORE"]] <- core_genes
+
+# 过滤掉基因太少的组 (比如少于 10 个基因的 lncRNA 不做富集)
+analysis_list <- analysis_list[sapply(analysis_list, length) >= 5]
+
+cat("Analysis Groups:\n")
+print(sapply(analysis_list, length))
+
+# 2. 定义数据库
+dbs <- c("MSigDB_Hallmark_2020", 
+         "Reactome_2022", 
+         "TF_Perturbations_Followed_by_Expression")
+
+# 3. 批量运行 EnrichR
+all_enrichment_results <- data.frame()
+
+cat("Running enrichment...\n")
+for(group_name in names(analysis_list)) {
+  genes <- analysis_list[[group_name]]
+  
+  if(length(genes) > 0) {
+    tryCatch({
+      enriched <- enrichr(genes, dbs)
+      
+      for(db in dbs) {
+        res <- enriched[[db]]
+        # 筛选显著的 (P < 0.05)
+        sig_res <- res %>% filter(Adjusted.P.value < 0.05)
+        
+        if(nrow(sig_res) > 0) {
+          sig_res$Group <- group_name
+          sig_res$Database <- db
+          all_enrichment_results <- rbind(all_enrichment_results, sig_res)
+        }
+      }
+    }, error = function(e) cat("Error in", group_name, "\n"))
+  }
+}
+
+# 保存原始结果 (作为附件 Supp Table)
+write.csv(all_enrichment_results, "Full_Enrichment_Results_Raw.csv")
+cat("Raw results saved. Now comes the curation part.\n")
+```
+
+
+```{r}
+library(dplyr)
+library(stringr)
+library(ggplot2)
+
+# ==============================================================================
+# 1. 定义关键词与标准化映射 (核心修改)
+# ==============================================================================
+# 我们不仅用它来分类，还用它来把 Term 名字缩短成“核心概念”
+
+keywords_map <- list(
+  "1_Stemness_Core" = c("POU5F1", "OCT4", "SOX2", "NANOG", "MYC", "KLF4", "Major"),
+  "2_Epigenetic_Mech" = c("EZH2", "SUZ12", "TET1", "TET2", "TET3", "DNMT"),
+  "3_Differentiation" = c("NEUROG", "Nervous", "Neuronal", "Axon", "GABA", "Epithelial Mesenchymal"),
+  "4_Stress_Death" = c("TNF", "NF-kB", "NFKB", "Apoptosis", "TP53", "Mitochondrial", "STAT3")
+)
+
+# 展平用于过滤
+flattened_keywords <- unlist(keywords_map)
+regex_pattern <- paste(flattened_keywords, collapse = "|")
+
+# ==============================================================================
+# 2. 数据处理与智能去重
+# ==============================================================================
+
+# A. 基础过滤 (人类相关 + 关键词命中)
+filtered_data <- all_enrichment_results %>%
+  filter(!grepl("mouse|rat|musculus|rattus|drosophila|yeast|zebrafish", Term, ignore.case = TRUE)) %>%
+  filter(grepl(regex_pattern, Term, ignore.case = TRUE))
+
+# B. 核心步骤：语义归纳 (Semantic Mapping)
+# 这里我们将复杂的句子转化为简单的核心词
+clean_data <- filtered_data %>%
+  mutate(Term_Display = Term) %>% 
+  
+  # --- 规则 1: 干性因子标准化 (解决 6个SOX 的问题) ---
+  mutate(Term_Display = case_when(
+    grepl("POU5F1", Term, ignore.case=T) ~ "POU5F1 Targets",
+    grepl("SOX2", Term, ignore.case=T) ~ "SOX2 Targets",
+    grepl("NANOG", Term, ignore.case=T) ~ "NANOG Targets",
+    grepl("MYC", Term, ignore.case=T) ~ "MYC Targets",
+    grepl("KLF4", Term, ignore.case=T) ~ "KLF4 Targets",
+    grepl("rRNA", Term, ignore.case=T) ~ "rRNA Processing",
+    TRUE ~ Term_Display
+  )) %>%
+  
+  # --- 规则 2: 表观遗传因子标准化 ---
+  mutate(Term_Display = case_when(
+    grepl("EZH2|SUZ12", Term, ignore.case=T) ~ "PRC2 Targets",
+    grepl("TET[1-3]", Term, ignore.case=T) ~ "TET1/2/3 Targets",
+    grepl("KDM2B", Term, ignore.case=T) ~ "KDM2B Targets",
+    grepl("DNMT1", Term, ignore.case=T) ~ "DNMT1 Targets",
+    TRUE ~ Term_Display
+  )) %>%
+  
+  # --- 规则 3: 关键通路标准化 (合并同义词) ---
+  mutate(Term_Display = case_when(
+    grepl("Nervous|Neuronal|NEUROG1|GABA|Axon", Term_Display, ignore.case=T) ~ "Nervous System Development",
+    grepl("Epithelial Mesenchymal|EMT", Term_Display, ignore.case=T) ~ "Epithelial Mesenchymal Transition",
+    grepl("NF-kB|NFKB|Apoptosis", Term_Display, ignore.case=T) ~ "Apoptosis",
+    grepl("Mitochondrial", Term_Display, ignore.case=T) ~ "Mitochondrial Function",
+    grepl("TP53", Term, ignore.case=T) ~ "TP53 Targets",
+    grepl("STAT3", Term, ignore.case=T) ~ "STAT3 Targets",
+    TRUE ~ Term_Display
+  )) %>% 
+  
+  # 如果没有被上面的规则改名，做一下基础清理
+  mutate(Term_Display = Term_Display %>% 
+           str_remove(" R-HSA.*") %>% 
+           str_remove(" Homo sapiens.*") %>%
+           str_trunc(50))
+
+# C. 核心步骤：去重 (Deduplication)
+# 对于每个 lncRNA (Group)，如果有名为 "SOX2 Targets" 的多条记录，只保留 P 值最小的那条
+plot_data <- clean_data %>%
+  group_by(lncRNA, Term_Display) %>%
+  arrange(Adjusted.P.value) %>%
+  slice_head(n = 1) %>% # <--- 关键：只取第一名
+  ungroup() %>%
+  
+  # D. 分类 (Category)
+  mutate(Category = case_when(
+    grepl(paste(keywords_map[["1_Stemness_Core"]], collapse="|"), Term, ignore.case=T) ~ "Pluripotency",
+    grepl(paste(keywords_map[["2_Epigenetic_Mech"]], collapse="|"), Term, ignore.case=T) ~ "Epigenetic Regulation",
+    grepl(paste(keywords_map[["3_Differentiation"]], collapse="|"), Term, ignore.case=T) ~ "Differentiation",
+    grepl(paste(keywords_map[["4_Stress_Death"]], collapse="|"), Term, ignore.case=T) ~ "Stress & Cell Death",
+    TRUE ~ "Other"
+  )) %>%
+  
+  # E. 最终筛选：每个类别只展示 Top 5 (防止图太长)
+  group_by(lncRNA, Category) %>%
+  arrange(Adjusted.P.value) %>%
+  slice_head(n = 10) %>%
+  ungroup() %>%
+  
+  # F. 计算 LogP
+  mutate(LogP = -log10(Adjusted.P.value)) %>%
+  # 设个上限防止点太大
+  mutate(LogP = ifelse(LogP > 10, 10, LogP)) %>%
+  mutate(
+    is_rRNA = ifelse(grepl("rRNA", Term_Display, ignore.case = TRUE), -1, 0),
+    Term_Display = factor(Term_Display)
+  ) %>%
+  arrange(Category, is_rRNA, Term_Display) %>%
+  mutate(Term_Display = factor(Term_Display, levels = unique(Term_Display)))
+
+# ==============================================================================
+# 3. 排序与绘图
+# ==============================================================================
+
+# 排序 LncRNA: CORE 在前
+group_levels <- c("CORE", sort(setdiff(unique(plot_data$lncRNA), "CORE")))
+plot_data$lncRNA <- factor(plot_data$lncRNA, levels = group_levels)
+
+# 排序 Category
+cat_levels <- c("Pluripotency Core", "Epigenetic Regulation", "Stress & Cell Death", "Differentiation")
+plot_data$Category <- factor(plot_data$Category, levels = cat_levels)
+
+p <- ggplot(plot_data, aes(x = lncRNA, y = Term_Display, size = LogP, color = Category)) +
+  geom_point(alpha = 0.8) +
+  
+  # 分面展示
+  facet_grid(Category ~ ., scales = "free_y", space = "free_y") +
+  
+  scale_size_continuous(range = c(2, 8), name = "-log10(Adj.P)") +
+  scale_color_brewer(palette = "Set1") +
+  
+  theme_bw() +
+  labs(title = "Consolidated Functional Landscape",
+       x = NULL, y = NULL) +
+  
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 7,
+                               color = ifelse(levels(plot_data$lncRNA) == "CORE", "red", "black")),
+    axis.text.y = element_text(size = 7),
+    strip.text = element_text(face = "bold", size = 10),
+    strip.background = element_rect(fill = "grey95"),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(size = 0.1)
+  )
+
+ggsave("Fig_Landscape_Deduplicated.pdf", p, width = 7, height = 5.5)
+print(p)
+```
+
+#export node edge info for Cytoscape
+```{r}
+# 导出边列表
+edges_for_cyto <- all_lnc_top_targets %>%
+  dplyr::select(source = lncRNA, target = gene, weight = lag_p, type = final_relationship)
+
+# 导出节点属性 (告诉 Cytoscape 谁是 Hub)
+nodes_for_cyto <- data.frame(id = unique(c(edges_for_cyto$source, edges_for_cyto$target))) %>%
+  mutate(node_type = ifelse(id %in% unique(edges_for_cyto$source), "LncRNA", "Gene")) %>%
+  # 标记是否是 Super Hub
+  mutate(is_super_hub = id %in% super_hub_genes) 
+
+write.csv(edges_for_cyto, "Network_Edges.csv", row.names = F)
+write.csv(nodes_for_cyto, "Network_Nodes.csv", row.names = F)
+```
+
+
+```{r}
+
+combined_counts <- combined_counts_plus[, -665] 
+rownames(combined_counts) <- combined_counts$gene_id 
+
+
+keep_times <- c("0", "2", "4", "8", "16", "24", "48", "96")
+
+col_data_filt <- col_data[as.character(col_data$time) %in% keep_times, ]
+
+col_data_filt$time <- factor(as.character(col_data_filt$time), levels = keep_times)
+
+combined_counts_filt <- combined_counts[, col_data_filt$sample_id]
+
+combined_counts_filt <- as.matrix(combined_counts_filt)
+
+
+# 创建一个临时的 DESeq 对象只用于计算归一化因子
+# ==============================================================================
+# Step 1: 标准化 (Normalization)
+# ==============================================================================
+# 确保使用 Normalized counts 以保证趋势真实
+dds_norm <- DESeqDataSetFromMatrix(countData = combined_counts_filt,
+                                   colData = col_data_filt,
+                                   design = ~ 1) 
+
+dds_norm <- estimateSizeFactors(dds_norm)
+norm_counts_mat <- counts(dds_norm, normalized = TRUE)
+
+norm_counts_df <- as.data.frame(norm_counts_mat) %>%
+  rownames_to_column("gene_id") %>%
+  left_join(g2s, by = "gene_id") 
+
+# ==============================================================================
+# Step 2: 筛选 12 个干性崩塌基因 (The Collapse Core)
+# ==============================================================================
+
+# 你的最终名单：包含了干性、代谢、表观、信号维持
+collapse_genes <- c("LINC00678", "HIPK2", "LOXL1", "SMAD3", "NCAM1","MIR302CHG")
+
+# 强制设置因子水平，保证画图时按照你想要的顺序排列（可选，这里按字母或自定义）
+# 这里我们让最核心的 NANOG, MYC 排在前面
+ordered_genes <- c("LINC00678", "HIPK2", "LOXL1", "SMAD3", "NCAM1","MIR302CHG")
+
+highlight_genes <- collapse_genes
+
+# ==============================================================================
+# Step 3: 数据处理
+# ==============================================================================
+
+plot_data_long <- norm_counts_df %>%
+  filter(gene_name %in% highlight_genes) %>% 
+  pivot_longer(
+    cols = -c(gene_id, gene_name),
+    names_to = "sample_id",
+    values_to = "normalized_counts"
+  ) %>%
+  left_join(col_data, by = "sample_id") %>%
+  mutate(time = as.numeric(as.character(time)))
+# ==============================================================================
+# 高级可视化：12个干性崩塌基因在同一张图中的标准化表达趋势
+# ==============================================================================
+
+# 使用 Z-score 标准化处理表达量差异
+plot_data_z <- plot_data_long %>%
+  group_by(gene_name) %>%
+  mutate(
+    z_score = (normalized_counts - mean(normalized_counts)) / sd(normalized_counts)
+  ) %>%
+  ungroup()
+
+# 计算标准化后的均值和标准误
+plot_summary_z <- plot_data_z %>%
+  group_by(gene_name, time) %>%
+  summarise(
+    mean_z = mean(z_score, na.rm = TRUE),
+    se_z = sd(z_score, na.rm = TRUE) / sqrt(n()),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    ymin = mean_z - se_z,
+    ymax = mean_z + se_z
+  )
+
+myc_color <- "#D62728"  # 突出的红色用于MIR302CHG
+other_colors <- c(
+  "#1F77B4",  # SSH2 - 蓝色
+  "#2CA02C",  # SSH1 - 绿色
+  "#9467BD",  # SRGAP1 - 紫色
+  "#8C564B",  # SRGAP2 - 棕色
+  "#7F7F7F" # FUS - 灰色
+)
+
+# 为每个基因分配颜色
+gene_colors <- setNames(c(myc_color, other_colors), ordered_genes)
+
+# ==============================================================================
+# 修正的绘图代码
+# ==============================================================================
+
+p_combined <- ggplot(plot_summary_z, aes(x = time, y = mean_z, group = gene_name)) +
+  
+  # 1. 为所有基因添加半透明的误差带背景
+  geom_ribbon(aes(ymin = ymin, ymax = ymax, fill = gene_name), 
+              alpha = 0.15, show.legend = FALSE) +
+  
+  # 2. 添加趋势线 - MIR302CHG用粗线突出显示
+  geom_line(aes(color = gene_name, size = gene_name, linetype = gene_name)) +
+  
+  # 3. 在关键时间点添加数据点
+  geom_point(aes(color = gene_name, shape = gene_name), 
+             size = 2, alpha = 0.8, data = plot_summary_z %>% filter(time %in% c(0, 4, 24, 96))) +
+  
+  # 4. 颜色、大小和线型映射 - 修正长度匹配问题
+  scale_color_manual(values = gene_colors) +
+  scale_fill_manual(values = gene_colors) +
+  scale_size_manual(values = setNames(c(1.5, rep(1, length(ordered_genes)-1)), ordered_genes)) +
+  scale_linetype_manual(values = setNames(rep("solid", length(ordered_genes)), ordered_genes)) +
+  scale_shape_manual(values = setNames(1:length(ordered_genes), ordered_genes)) +
+  
+  # 5. 坐标轴和标签
+  labs(
+    x = "Time (h)",
+    y = "Z-score Normalized Counts",
+    title = "Trend of lncRNA and Targets (DBN Inference)",
+    color = "Gene",
+    shape = "Gene",
+    linetype = "Gene",
+    size = "Gene"
+  ) +
+  
+  # 6. 高水平期刊主题设置
+  theme_classic() +
+  theme(
+    # 文本元素
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5, 
+                              margin = margin(b = 10)),
+    plot.subtitle = element_text(size = 12, hjust = 0.5, color = "grey40",
+                                 margin = margin(b = 15)),
+    axis.title = element_text(size = 13, face = "bold"),
+    axis.text = element_text(size = 11, color = "black"),
+    axis.line = element_line(color = "black", linewidth = 0.5),
+    axis.ticks = element_line(color = "black", linewidth = 0.5),
+    
+    # 图例设置
+    legend.position = "right",
+    legend.title = element_text(face = "bold", size = 11),
+    legend.text = element_text(size = 10, face = "italic"),
+    legend.key.size = unit(0.8, "lines"),
+    legend.spacing.y = unit(0.2, "lines"),
+    
+    # 边距和背景
+    plot.margin = margin(20, 30, 20, 20),
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background = element_rect(fill = "white", color = NA)
+  ) +
+  
+  # 7. 坐标轴刻度优化
+  scale_x_continuous(
+    breaks = c(0, 4, 8, 24, 48, 96),
+    expand = expansion(mult = c(0.02, 0.05))
+  ) +
+  scale_y_continuous(
+    expand = expansion(mult = c(0.05, 0.05))
+  ) +
+  
+  # 8. 添加辅助网格线（期刊风格）
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey70", linewidth = 0.3) +
+  geom_vline(xintercept = c(0, 24, 96), linetype = "dotted", color = "grey80", linewidth = 0.2)
+
+# 预览图表
+print(p_combined)
+
+# ==============================================================================
+# 保存高质量图片
+# ==============================================================================
+
+ggsave(
+  filename = "Figure_combined_linc00678_target_ribbon.pdf",
+  plot = p_combined,
+  path = "~/RNAseq/RNAseq_FULL_MODEL/combined time/DBN_results/figures/trend_validation/",
+  width = 8,          # 适合多基因图表的宽度
+  height = 6,          # 适当的高度比例
+  dpi = 300,           # 高分辨率输出
+  device = cairo_pdf   # 使用Cairo PDF获得更好的字体渲染
+)
+
+```
+
+#单独画每个lncRNA
+```{r}
+library(STRINGdb)
+library(dplyr)
+library(tidygraph)
+library(ggraph)
+library(graphlayouts) 
+library(ggsci) 
+enriched_data <- filtered_data %>%
+  # 过滤Group以"specific"结尾的行
+  filter(str_ends(Group, "Specific")) %>%
+  # 分离基因列表 (Genes列用分号分隔)
+  mutate(gene_list = str_split(Genes, ";")) %>%
+  # 展开成每行一个基因
+  unnest(gene_list) %>%
+  mutate(gene = str_trim(gene_list)) %>%
+  # 清理基因名
+  filter(!is.na(gene) & gene != "") %>%
+  # 根据all_lnc_top_targets表过滤关系类型
+  inner_join(all_lnc_top_targets %>% 
+               filter(`final_relationship` %in% c("gene_regulates_lnc", "lnc_regulates_gene")) %>%
+               dplyr::select(gene, `final_relationship`),
+             by = "gene") %>%
+  # 选择关键列
+  dplyr::select(lncRNA = Group, Term, gene, Adjusted.P.value, Database, `final_relationship`) %>%
+  distinct()
+save(all_enrichment_results, filtered_data, enriched_data, file = "all_enriched_results.RData")
+# 1. 初始化 STRING 数据库 (人类)
+# score_threshold = 400 (中等置信度) 或 700 (高置信度)
+string_db <- STRINGdb$new(species = 9606, version = "11.5", score_threshold = 400)
+
+# 2. 准备你的 lncRNA 靶基因数据
+# 假设 enriched_data 是你之前筛选好的 specific_genes
+enriched_data <-all_lnc_top_targets %>% filter(`final_relationship` %in% c("gene_regulates_lnc", "lnc_regulates_gene")) 
+target_lnc_name <- "LINC00678"
+input_genes <- enriched_data %>%
+  filter(str_detect(lncRNA, target_lnc_name)) %>% # 匹配名字
+  pull(gene) %>%
+  unique()
+
+cat("输入基因数量:", length(input_genes), "\n")
+
+# ==============================================================================
+# 1. STRING 映射与互作查找
+# ==============================================================================
+
+# A. 将基因名映射到 STRING ID
+genes_mapped <- string_db$map(data.frame(gene = input_genes), "gene", removeUnmappedRows = TRUE)
+
+cat("成功映射到 STRING 的基因数:", nrow(genes_mapped), "\n")
+
+# B. 获取这些基因内部的互作 (PPI)
+# payload_id 是 STRING 的内部 ID
+ppi_links <- string_db$get_interactions(genes_mapped$STRING_id)
+
+# C. 将 STRING ID 转换回 Gene Symbol (为了画图让人看懂)
+# 建立一个 ID -> Symbol 的对照表
+id_to_symbol <- setNames(genes_mapped$gene, genes_mapped$STRING_id)
+
+ppi_edges <- ppi_links %>%
+  mutate(from_gene = id_to_symbol[from],
+         to_gene = id_to_symbol[to]) %>%
+  filter(!is.na(from_gene) & !is.na(to_gene)) %>% # 去掉映射失败的
+  select(from = from_gene, to = to_gene, combined_score) %>%
+  mutate(type = "PPI (STRING)") # 标记边的类型
+
+# ==============================================================================
+# 2. 整合 DBN 边 (LncRNA -> Gene)
+# ==============================================================================
+
+# 这些基因是 STRING 验证过的，我们只画这些
+valid_genes <- unique(c(ppi_edges$from, ppi_edges$to))
+
+dbn_edges_corrected <- enriched_data %>%
+  # 1. 筛选出属于 PPI 网络中的基因
+  filter(gene %in% valid_genes) %>%
+  # 2. 匹配 lncRNA 名字
+  filter(str_detect(lncRNA, target_lnc_name)) %>%
+  # 3. 提取关系
+  select(lncRNA, gene, final_relationship) %>%
+  distinct() %>%
+  # 4. 【核心步骤】根据关系交换起点终点
+  mutate(from = ifelse(final_relationship == "lnc_regulates_gene", 
+                       str_remove(lncRNA, "_Specific"), # 起点是 LncRNA
+                       gene),                           # 起点是 Gene
+         to   = ifelse(final_relationship == "lnc_regulates_gene", 
+                       gene,                            # 终点是 Gene
+                       str_remove(lncRNA, "_Specific")), # 终点是 LncRNA
+         type = "DBN (Regulatory)",
+         combined_score = 1000) %>% # 虚拟高分
+  select(from, to, type, combined_score)
+
+# 合并 PPI 边 (保持之前的 ppi_edges 不变)
+all_edges_fixed <- rbind(ppi_edges, dbn_edges_corrected)
+
+# 构建节点列表
+all_nodes_fixed <- data.frame(name = unique(c(all_edges_fixed$from, all_edges_fixed$to))) %>%
+  mutate(node_type = case_when(
+    name == str_remove(target_lnc_name, "_Specific") ~ "LncRNA",
+    name %in% hub_genes ~ "Protein Hub (Key Effector)",
+    TRUE ~ "Target Gene"
+  ))
+
+# ==============================================================================
+# 3. 寻找“核心蛋白” (Hub Genes in PPI)
+# ==============================================================================
+# 如果一个基因在 PPI 网络里连接了很多其他靶基因，它就是中间的 Mediator
+
+# 计算 PPI Degree
+ppi_degree <- table(c(ppi_edges$from, ppi_edges$to))
+hub_genes <- names(ppi_degree[ppi_degree >= 3]) # 连接超过3个的算 Hub
+
+# 构建节点属性
+all_nodes <- data.frame(name = unique(c(all_edges$from, all_edges$to))) %>%
+  mutate(node_type = case_when(
+    name == target_lnc_name ~ "LncRNA",
+    name %in% hub_genes ~ "Protein Hub (Key Effector)",
+    TRUE ~ "Target Gene"
+  ))
+
+#识别cluster 功能
+# 先生成临时对象计算聚类
+temp_graph <- tbl_graph(nodes = all_nodes_fixed, edges = all_edges_fixed) %>%
+  activate(nodes) %>%
+  morph(to_undirected) %>%
+  mutate(community = as.factor(group_louvain())) %>%
+  unmorph()
+
+# --- 查看每个 Cluster 里有哪些 Hub 基因 ---
+# 通过看这些基因，你可以推断出这个 Cluster 的名字
+cluster_info <- temp_graph %>%
+  as_tibble() %>%
+  group_by(community) %>%
+  summarise(
+    Top_Genes = paste(head(name, 5), collapse = ", "), # 看前5个基因
+    Count = n()
+  )
+
+print(cluster_info)
+# ==============================================================================
+# 4. 可视化 (ggraph)
+# ==============================================================================
+
+# 定义你的生物学标签映射
+cluster_labels <- c(
+  "1" = "Actin Cytoskeleton & GTPase",
+  "2" = "Mito. Metabolism & Signaling",
+  "3" = "RNA Processing & Translation",
+  "4" = "Cell Cycle & Transcription",
+  "5" = "Glucose Metabolism & Adhesion",
+  "6" = "Chromatin & Epigenetics",
+  "7" = "Membrane Dynamics"
+)
+
+cluster_labels_new <- c(
+  "1"  = "Cell Cycle Arrest & Stress",
+  "2"  = "Apoptosis & Lysosomal Pathway",
+  "3"  = "TGF-beta & Nuclear Transport",
+  "4"  = "Chromatin Remodeling (Polycomb)",
+  "5"  = "Oxidative Stress & Lipid Metab.",
+  "6"  = "Neuronal Synapse & Axon Guidance",
+  "7"  = "Vesicle Trafficking & Exocytosis",
+  "8"  = "Neuropeptides & Glycobiology",
+  "9"  = "Ribosome Biogenesis",
+  "10" = "Extracellular Matrix (ECM)"
+)
+
+# 重新构建 Graph (确保之前的数据准备步骤已运行)
+final_graph <- temp_graph %>%
+  activate(nodes) %>%
+  mutate(
+    degree = centrality_degree(mode = 'all'),
+    font_face = ifelse(node_type == "Target Gene", "plain", "bold"),
+    label_size = ifelse(node_type == "Target Gene", 3, 5)
+  )
+
+p <- ggraph(final_graph, layout = "stress") + 
+  
+  # --- 1. 画 PPI 边 (灰色) ---
+  geom_edge_arc(aes(filter = type == "PPI (STRING)", alpha = combined_score), 
+                color = "grey85", strength = 0.1, edge_width = 0.4) + 
+  
+  # --- 2. 画 DBN 边 (红色，带箭头) ---
+  # 修复箭头方向逻辑（如果之前没修，这里要确保源数据是对的）
+  geom_edge_link(aes(filter = type == "DBN (Regulatory)"), 
+                 color = "#E64B35", edge_width = 0.2, alpha = 0.5,
+                 arrow = arrow(length = unit(4, 'mm'), type = "closed")) +
+  
+  # --- 3. 画节点 ---
+  geom_node_point(aes(color = community, shape = node_type, size = node_type),
+                  alpha = 0.9) +
+  
+  # --- 4. 标签 ---
+  geom_node_text(aes(label = name, size = I(label_size), fontface = font_face), 
+                 repel = TRUE, bg.color = "white", bg.r = 0.15, color = "black", max.overlaps = 30) +
+  
+  # --- 5. 样式 ---
+  
+  # 形状和大小
+  scale_shape_manual(values = c("LncRNA" = 18, "Protein Hub (Key Effector)" = 19, "Target Gene" = 19)) +
+  scale_size_manual(values = c("LncRNA" = 9, "Protein Hub (Key Effector)" = 6, "Target Gene" = 3)) +
+  
+  # 【关键修改】颜色映射 + 生物学标签
+  scale_color_npg(name = "Functional Module (PPI Cluster)",
+                  labels = cluster_labels_new) + 
+  
+  # 隐藏不必要的图例
+  scale_edge_alpha_continuous(guide = "none") + 
+  
+  # 合并节点类型图例
+  guides(
+    shape = guide_legend(title = "Node Type", override.aes = list(size = 5), order = 1),
+    size = guide_legend(title = "Node Type", order = 1),
+    color = guide_legend(override.aes = list(size = 5), order = 2, ncol = 1) # 功能图例单列显示
+  ) +
+  
+  theme_void() +
+  theme(legend.position = "right", 
+        legend.title = element_text(face = "bold", size = 12),
+        legend.text = element_text(size = 10),
+        plot.margin = margin(10, 10, 10, 10))
+
+# 保存
+ggsave("Network_LINC00678_Final_Annotated.pdf", p, width = 12, height = 9)
+print(p)
+```
+

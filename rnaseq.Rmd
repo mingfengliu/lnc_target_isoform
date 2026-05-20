@@ -1,0 +1,1543 @@
+---
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(bitmapType = "cairo")
+
+# Load required libraries
+suppressPackageStartupMessages({
+  library(IRanges)
+  library(tidyverse)
+  library(magrittr)
+  library(pheatmap)
+  library(Rcpp)
+  library(DESeq2)
+  library(rmarkdown)
+  library(MatrixGenerics)
+  library(ggrepel)
+  library(limma)
+  library(viridis)
+  library(UpSetR)
+  library(ggvenn)
+  library(clusterProfiler)
+  library(org.Hs.eg.db)
+  library(enrichplot)
+  library(enrichR)
+  library(stringr)
+  library(fgsea)
+  library(AnnotationDbi)
+  library(gridExtra)
+  library(patchwork)
+})
+```
+
+```{r  data_loading}
+# Set working directory
+setwd("/scratch/Shares/rinn/ML/RNAseq_FULL_MODEL/combined time")
+
+# Define base path and cell line IDs
+base_path <- "/scratch/Shares/rinn/lincxpress/"
+linc_ids <- c("GFP", "GFP_12Sept2024", "BANCR", "HULC", "RP11", "CRNDE", "DANCR203", "FENDRR", 
+              "LINC00667", "LINC00847", "LINC01547", "HAGLR", "HEIH", "LINCPINT", "LINCROR", 
+              "LNCPRESS1", "PNKY", "TUG1_210", "TUG1_217", "hipsc_empty")
+
+# Initialize list to store raw count data
+counts_list <- list()
+
+# Loop through IDs and load data
+for (linc_id in linc_ids) {
+  file_path <- file.path(base_path, linc_id, "rnaseq/nextflow_results/star_salmon/salmon.merged.gene_counts.tsv")
+  
+  if (file.exists(file_path)) {
+    cat("Loading:", file_path, "\n")
+    counts_list[[linc_id]] <- read.table(file_path, header = TRUE, sep = "\t", row.names = 1)
+  } else {
+    cat("Warning: File not found:", file_path, "\n")
+  }
+}
+
+# 1. Create GeneID to GeneName mapping (g2s) using the first available dataset
+first_id <- names(counts_list)[1]
+g2s <- data.frame(
+  gene_id = rownames(counts_list[[first_id]]),
+  gene_name = counts_list[[first_id]][, 1]
+)
+
+# 2. Clean data: Remove gene_name column and round counts (integers required for DESeq2)
+for (linc_id in names(counts_list)) {
+  counts_list[[linc_id]] <- counts_list[[linc_id]][, -1]
+  counts_list[[linc_id]] <- round(counts_list[[linc_id]])
+}
+
+# 3. Intersect common genes across all datasets
+common_genes <- Reduce(intersect, lapply(counts_list, rownames))
+counts_list <- lapply(counts_list, function(df) df[common_genes, , drop = FALSE])
+
+# 4. Combine into a single matrix
+combined_counts <- do.call(cbind, unname(counts_list))
+
+# 5. Create Metadata (col_data) and clean sample names
+col_data <- data.frame(sample_id = colnames(combined_counts))
+
+# Apply regex to standardize sample names
+# Format: Condition_c{Clone}b{Batch}_Time
+colnames(combined_counts) <- gsub("^([A-Za-z]+)_C(\\d+)_B(\\d+)_", "\\1c\\2b\\3_", col_data$sample_id)
+colnames(combined_counts) <- gsub("^([A-Za-z0-9]+)_C(\\d+)_B(atch)?(\\d+)_", "\\1c\\2b\\4_", col_data$sample_id)
+colnames(combined_counts) <- gsub("GFP_", "GFPc18_", colnames(combined_counts))
+colnames(combined_counts) <- gsub("LINC\\.ROR_", "LINCROR_", colnames(combined_counts))
+
+# Update col_data sample_id to match matrix column names
+col_data$sample_id <- colnames(combined_counts)
+
+# Create a combined data frame with gene names for easy lookup later
+combined_counts_plus <- as.data.frame(combined_counts) %>%
+  rownames_to_column("gene_id") %>%
+  merge(g2s, by = "gene_id")
+
+# 6. Parse Metadata (Condition, Time, Replicate)
+split_values <- strsplit(col_data$sample_id, "_")
+col_data$condition <- sapply(split_values, function(x) x[[1]])
+col_data$time <- sapply(split_values, function(x) x[[2]])
+col_data$replicate <- sapply(split_values, function(x) x[[3]])
+
+# Set Time as Factor with specific levels order
+time_levels <- c("0", "0.5", "1", "1.5", "2", "2.5", "3", "3.5", "4", "4.5", "5", "5.5", "8", "12", "16", "24", "48", "96")
+col_data$time <- factor(col_data$time, levels = time_levels)
+
+# Save intermediate data
+save(combined_counts_plus, col_data, g2s, file = "results/combined_counts_with_gene_name.RData")
+```
+
+```{r deseq_analysis}
+# Initialize lists
+dds_list <- list()
+res_list <- list()
+all_results_df <- data.frame()
+
+# Get unique cell lines (conditions)
+conditions <- unique(col_data$condition)
+
+# Loop: Run DESeq2 for each condition individually
+for (cond in conditions) {
+  message("Processing condition: ", cond)
+  
+  # Subset data for current condition
+  sub_col_data <- col_data[col_data$condition == cond, ]
+  sub_counts <- combined_counts[, sub_col_data$sample_id]
+  
+  # Ensure time levels are consistent
+  sub_col_data$time <- factor(as.character(sub_col_data$time), levels = levels(col_data$time))
+  
+  # DESeq2 Object
+  dds <- DESeqDataSetFromMatrix(countData = sub_counts,
+                                colData = sub_col_data,
+                                design = ~ time)
+  
+  # Run LRT (Likelihood Ratio Test) for time series
+  dds <- DESeq(dds, test = "LRT", reduced = ~1)
+  
+  dds_list[[cond]] <- dds
+  res_list[[cond]] <- results(dds)
+  
+  # Extract all results (Time X vs Time 0)
+  res_names <- resultsNames(dds)[-1] # Remove Intercept
+  
+  for (res_name in res_names) {
+    res <- results(dds, name = res_name)
+    
+    # Tidy format
+    tmp_df <- as.data.frame(res) %>%
+      rownames_to_column("gene_id") %>%
+      left_join(g2s, by = "gene_id") %>%
+      mutate(
+        condition = cond,
+        result_name = res_name,
+        # Extract numeric timepoint from result name (e.g., time_24_vs_0)
+        timepoint = as.numeric(sub("time_([0-9\\.]+)_vs_0", "\\1", res_name))
+      )
+    
+    all_results_df <- bind_rows(all_results_df, tmp_df)
+  }
+}
+
+save(dds_list, res_list, all_results_df, file = "results/all_results_df.RData")
+```
+
+```{r Complex Composite Plot (Sparklines + Global Boxplot)}
+# --- 1. Prepare Boxplot Data (Middle Panel) ---
+
+# Step 1: Filter padj ≤ 0.01
+filtered_df <- all_results_df %>%
+  filter(padj <= 0.01 & baseMean >= 20)
+
+# Step 2: Compute max FC per gene per condition
+maxfc_df <- filtered_df %>%
+  group_by(condition, gene_id) %>%
+  summarize(
+    max_fc = log2FoldChange[which.max(abs(log2FoldChange))],
+    .groups = "drop"
+  )
+
+# Step 3: Join and filter for max_fc ≥ 1
+filtered_df <- filtered_df %>%
+  left_join(maxfc_df, by = c("condition", "gene_id")) %>%
+  filter(max_fc >= 1 | max_fc <= -1)
+
+# Step 4: Mark up/down direction
+filtered_df <- filtered_df %>%
+  mutate(
+    up = log2FoldChange >= 0.58,
+    down = log2FoldChange <= -0.58
+  )
+
+# Step 5: Use only late timepoints to determine consistent genes
+valid_time_points <- c(24, 48, 96)
+
+trend_summary <- filtered_df %>%
+  filter(timepoint %in% valid_time_points) %>%
+  group_by(condition, gene_id) %>%
+  summarize(
+    up_count = sum(up, na.rm = TRUE),
+    down_count = sum(down, na.rm = TRUE),
+    total_comparisons = n(),
+    .groups = "drop"
+  ) %>%
+  filter(total_comparisons == length(valid_time_points)) %>%
+  filter(up_count >= 3 | down_count >= 3)
+
+# 修复连接问题
+filtered_df<- filtered_df %>%
+  inner_join(trend_summary[, c("condition", "gene_id")], 
+             by = c("condition", "gene_id"))
+
+# 筛选特定细胞系：GFP 只使用 GFPc5b2，LINC00667 只使用 LINC00667c4b1，TUG1210 只使用 TUG1210c9b1
+filtered_df<- filtered_df %>%
+  filter(!(str_detect(condition, "^GFP") & condition != "GFPc5b2")) %>%
+  filter(!(str_detect(condition, "^LINC00667") & condition != "LINC00667c4b1")) %>%
+  filter(!(str_detect(condition, "^TUG1210") & condition != "TUG1210c9"))
+
+
+# Assign direction (Up/Down)
+filtered_df <- filtered_df %>%
+  mutate(direction = ifelse(log2FoldChange > 0, "Up", "Down"))
+
+# Extract data for plotting: one point per gene per condition (max absolute FC)
+plot_data_box <- filtered_df %>%
+  group_by(condition, gene_id) %>%
+  slice_max(order_by = abs(log2FoldChange), n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  mutate(clean_name = str_remove(condition, "c[0-9].*"), # Clean condition names
+         clean_name = str_remove(clean_name, "_.*"))
+
+# Custom ranking logic
+custom_order <- function(names) {
+  # Separate WT and GFP
+  wt_gfp <- c("WT", "GFP")
+  wt_gfp_present <- wt_gfp[wt_gfp %in% names]
+  
+  # Get other names (excluding WT and GFP) and sort alphabetically
+  other_names <- setdiff(names, wt_gfp)
+  other_names_sorted <- sort(other_names)
+  
+  # Combine: WT, GFP, then sorted other names
+  return(c(wt_gfp_present, other_names_sorted))
+}
+
+# Get unique clean_names
+all_clean_names <- unique(plot_data_box$clean_name)
+
+# Create custom order
+custom_order_vec <- custom_order(all_clean_names)
+
+# Apply ordering to clean_name factor
+plot_data_box$clean_name <- factor(plot_data_box$clean_name, levels = custom_order_vec)
+
+# Calculate counts for Up/Down labels
+stats_df <- plot_data_box %>%
+  group_by(clean_name, direction) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  mutate(y_pos = ifelse(direction == "Up", 0.5, -0.5), label = as.character(count))
+
+# --- 2. Plot Lower Part (Boxplot) ---
+
+p_box <- ggplot(plot_data_box, aes(x = clean_name, y = log2FoldChange)) +
+  geom_jitter(aes(color = direction), width = 0.25, size = 0.6, alpha = 0.5) +
+  geom_boxplot(outlier.shape = NA, fill = "white", color = "black", 
+               width = 0.6, size = 0.6, alpha = 0.7) +
+  geom_hline(yintercept = 0, color = "grey60") +
+  geom_hline(yintercept = c(-1, 1), linetype = "dashed", color = "gray40") +
+  # Add count labels
+  geom_text(data = stats_df, aes(x = clean_name, y = y_pos, label = label, color = direction), 
+           size = 3) +
+  scale_color_manual(values = c("Up" = "#B2182B", "Down" = "#2166AC")) + 
+  scale_y_continuous(limits = c(-16, 12.5)) + 
+  theme_classic() + 
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, color = "black"),
+    legend.position = "none"
+  ) +
+  labs(x = NULL, y = "Max log2FC")
+
+# --- 3. Prepare Sparklines Data (Top Panel) ---
+
+# Map cell line names to target gene symbols
+target_gene_map <- c(
+  "TUG1210"   = "TUG1",
+  "TUG1217"   = "TUG1",
+  "PNKY"      = "RP1-273N12.4",
+  "RP11"      = "RP11-1055B8.4",
+  "LINCPINT"  = "LINC-PINT",
+  "LINCROR"   = "LINC-ROR",
+  "LINC00667" = "LINC00667", 
+  "LINC00847" = "LINC00847", 
+  "HULC"      = "HULC",
+  "LINC01547" = "LINC01547",
+  "DANCR203"  = "DANCR",     
+  "HEIH"      = "HEIH",
+  "FENDRR"    = "FENDRR",
+  "CRNDE"     = "CRNDE",
+  "LNCPRESS1" = "LNCPRESS1",
+  "BANCR"     = "BANCR",
+  "HAGLR"     = "HAGLR",
+  "GFP"       = NA, 
+  "WT"        = NA 
+)
+
+# Define expected timepoints
+expected_timepoints <- c(0, 2, 4, 8, 16, 24, 48, 96)
+
+# Generate Sparkline Data
+spark_list <- list()
+max_fc_labels <- list() 
+
+ordered_conditions <- custom_order_vec
+
+for (cell_line in ordered_conditions) {
+  
+  target_gene_symbol <- target_gene_map[cell_line]
+  
+  # --- Case A: Negative Controls (GFP/WT) ---
+  if (is.na(target_gene_symbol)) {
+    dummy_df <- data.frame(
+      timepoint = expected_timepoints,
+      mean_fc = 0, 
+      scaled_fc = 0,
+      group = "No Target",
+      panel_group = cell_line
+    )
+    spark_list[[cell_line]] <- dummy_df
+    
+    max_fc_labels[[cell_line]] <- data.frame(
+        panel_group = cell_line,
+        x_pos = 10, y_pos = 1.1, 
+        label = "Control"
+    )
+    next
+  }
+  
+  # --- Case B: Experimental Lines ---
+  gene_data <- all_results_df %>% filter(gene_name == target_gene_symbol)
+  
+  if(nrow(gene_data) == 0) next
+  
+  gene_data <- gene_data %>%
+    mutate(
+      clean_cond = str_remove(condition, "c[0-9].*"),
+      clean_cond = str_remove(clean_cond, "_.*")
+    )
+  
+  # 1. Calculate Raw Trends
+  # Self trend: filter for this cell line and expected timepoints
+  self_trend_raw <- gene_data %>%
+    filter(clean_cond == cell_line) %>%
+    mutate(timepoint_num = as.numeric(timepoint)) %>%
+    filter(timepoint_num %in% expected_timepoints) %>%
+    group_by(timepoint_num) %>%
+    summarise(mean_fc = mean(log2FoldChange, na.rm=TRUE), .groups="drop") %>%
+    rename(timepoint = timepoint_num)
+  
+  # Force insert 0 point if not present
+  if(!0 %in% self_trend_raw$timepoint) {
+    self_trend_raw <- bind_rows(
+      data.frame(timepoint = 0, mean_fc = 0),
+      self_trend_raw
+    )
+  }
+  
+  self_trend <- self_trend_raw %>%
+    mutate(group = "Target", panel_group = cell_line) %>%
+    arrange(timepoint)
+  
+  # Other trend: filter for other cell lines but same expected timepoints
+  other_trend_raw <- gene_data %>%
+    filter(clean_cond != cell_line) %>%
+    mutate(timepoint_num = as.numeric(timepoint)) %>%
+    filter(timepoint_num %in% expected_timepoints) %>%
+    group_by(timepoint_num) %>%
+    summarise(mean_fc = mean(log2FoldChange, na.rm=TRUE), .groups="drop") %>%
+    rename(timepoint = timepoint_num)
+  
+  # Force insert 0 point if not present
+  if(!0 %in% other_trend_raw$timepoint) {
+    other_trend_raw <- bind_rows(
+      data.frame(timepoint = 0, mean_fc = 0),
+      other_trend_raw
+    )
+  }
+  
+  other_trend <- other_trend_raw %>%
+    mutate(group = "Background", panel_group = cell_line) %>%
+    arrange(timepoint)
+  
+  # --- 2. Calculate Normalization Factor ---
+  local_max <- max(self_trend$mean_fc, na.rm = TRUE)
+  scaling_factor <- ifelse(local_max > 0.1, local_max, 1) 
+  
+  # Normalize both Target and Background
+  combined_df <- bind_rows(self_trend, other_trend) %>%
+    mutate(scaled_fc = mean_fc / scaling_factor)
+  
+  spark_list[[cell_line]] <- combined_df
+  
+  # --- 3. Record Labels ---
+  max_fc_labels[[cell_line]] <- data.frame(
+    panel_group = cell_line,
+    x_pos = 10, 
+    y_pos = 1.5,
+    label = paste0("Max: ", round(local_max, 1))
+  )
+}
+
+sparkline_df <- bind_rows(spark_list)
+label_df <- bind_rows(max_fc_labels)
+
+# Ensure factor levels match boxplot order
+sparkline_df$panel_group <- factor(sparkline_df$panel_group, levels = ordered_conditions)
+label_df$panel_group <- factor(label_df$panel_group, levels = ordered_conditions)
+sparkline_df$timepoint <- as.numeric(as.character(sparkline_df$timepoint))
+
+# Filter to only include expected timepoints in the final plot
+sparkline_df_filtered <- sparkline_df %>%
+  filter(timepoint %in% expected_timepoints)
+
+# --- 4. Plot Upper Part (Sparklines) ---
+
+p_spark <- ggplot(sparkline_df_filtered, aes(x = timepoint, y = scaled_fc, group = group)) +
+  # Background line
+  geom_line(data = subset(sparkline_df_filtered, group == "Background"), 
+            color = "grey80", size = 0.8) +
+  
+  # Target line (Area + Line)
+  geom_area(data = subset(sparkline_df_filtered, group == "Target"), 
+            fill = "#B2182B", alpha = 0.2) + 
+  geom_line(data = subset(sparkline_df_filtered, group == "Target"), 
+            color = "#B2182B", size = 0.8) +
+  
+  # Labels
+  geom_text(data = label_df, aes(x = x_pos, y = y_pos, label = label), inherit.aes = FALSE, 
+            color = ifelse(label_df$label == "Control", "grey50", "#B2182B"),
+            size = 3, hjust = 0) +
+  
+  # Faceting
+  facet_grid(~ panel_group, switch = "x") +
+  
+  theme_void() +
+  theme(
+    strip.text = element_blank(),
+    panel.spacing = unit(0.1, "lines"), 
+    plot.margin = margin(b = -10, l = 5, r = 5) 
+  ) +
+  scale_x_continuous(breaks = expected_timepoints, expand = c(0, 0)) +
+  coord_cartesian(ylim = c(-0.5, 1.5))
+
+# --- 5. Combine Plots ---
+
+p_final <- p_spark / p_box + plot_layout(heights = c(1, 4))
+
+# Save
+ggsave("figures/fig1/Fig_Boxplot_with_Sparklines.pdf", 
+       p_final, width = 14, height = 8)
+```
+
+```{r define_drgs_and_ribbon}
+# ==============================================================================
+# 1. Define Significant Genes (Filtering Strategy)
+# ==============================================================================
+
+# Filter 1: Statistical Significance
+filtered_df <- all_results_df %>%
+  filter(padj <= 0.01 & baseMean >= 20)
+
+# Filter 2: Max Fold Change >= 1 (abs)
+maxfc_df <- filtered_df %>%
+  group_by(condition, gene_id) %>%
+  summarize(
+    max_fc = log2FoldChange[which.max(abs(log2FoldChange))],
+    .groups = "drop"
+  )
+
+filtered_df <- filtered_df %>%
+  left_join(maxfc_df, by = c("condition", "gene_id")) %>%
+  filter(abs(max_fc) >= 1)
+
+# Filter 3: Consistency in Late Timepoints (24, 48, 96h)
+filtered_df <- filtered_df %>%
+  mutate(
+    up = log2FoldChange >= 0.58,
+    down = log2FoldChange <= -0.58
+  )
+
+valid_time_points <- c(24, 48, 96)
+
+trend_summary <- filtered_df %>%
+  filter(timepoint %in% valid_time_points) %>%
+  group_by(condition, gene_id) %>%
+  summarize(
+    up_count = sum(up, na.rm = TRUE),
+    down_count = sum(down, na.rm = TRUE),
+    total_comparisons = n(),
+    .groups = "drop"
+  ) %>%
+  # Must be present in all 3 late timepoints and consistently Up or Down
+  filter(total_comparisons == length(valid_time_points)) %>%
+  filter(up_count >= 3 | down_count >= 3)
+
+# Determine Dominant Direction across all conditions
+gene_dominant_conditions <- trend_summary %>%
+  group_by(gene_id) %>%
+  summarise(
+    n_up = sum(up_count > down_count),    # Count conditions where gene is Up
+    n_down = sum(down_count > up_count),  # Count conditions where gene is Down
+    dominant_direction = ifelse(n_up > n_down, "up", "down"),
+    .groups = "drop"
+  ) %>%
+  filter(n_up != n_down) # Remove ties
+
+# Merge back to get the final long table
+final_sig_genes <- filtered_df %>%
+  left_join(gene_dominant_conditions, by = "gene_id") %>%
+  filter(!is.na(dominant_direction)) %>%
+  # Keep only data matching the dominant direction
+  filter((dominant_direction == "up" & up == TRUE) | (dominant_direction == "down" & down == TRUE))
+
+# Annotate Gene Type
+genes_gtf <- rtracklayer::import("/scratch/Shares/rinn/ML/hipsc_timecourse_GFP/genomes/gencode.v38.annotation.gene.gtf")
+gene_annot_df <- as.data.frame(mcols(genes_gtf[genes_gtf$type == "gene"]))[, c("gene_id", "gene_type")]
+
+final_sig_genes <- final_sig_genes %>%
+  left_join(gene_annot_df, by = "gene_id")
+
+write.csv(final_sig_genes, file = "results/final_sig_genes_log2fc1.csv")
+
+# ==============================================================================
+# 2. Define DRGs (Dox Response Genes Signature)
+# ==============================================================================
+# Definition: Shared in >= 21 out of 28 conditions (75%)
+
+sig_genes_21_to_28 <- final_sig_genes %>%
+  select(gene_id, gene_name, n_up, n_down) %>%
+  distinct() %>%
+  filter(n_up >= 21 | n_down >= 21)
+
+print(paste("DRGs Genes Identified:", nrow(sig_genes_21_to_28))) # Should be 209
+write.csv(unique(sig_genes_21_to_28$gene_name), file = "results/sig_genes_21_to_28.csv")
+save(sig_genes_21_to_28, file = "results/sig_genes_21_to_28.RData")
+
+# Also save lncRNAs found in this high-frequency set
+sig_lncRNA_18_to_24 <- final_sig_genes %>%
+  filter(gene_type == "lncRNA") %>%
+  group_by(gene_id, gene_name) %>%
+  summarise(n_up = first(n_up), n_down = first(n_down)) %>%
+  filter(n_up >= 21 | n_down >= 21)
+
+write.csv(unique(sig_lncRNA_18_to_24$gene_name), file = "results/sig_lncRNA_18_to_24.csv")
+
+# ==============================================================================
+# 3. Visualization: Ribbon Plot (Stemness Collapse)
+# ==============================================================================
+
+# Prepare normalized counts
+# Create a temp dds object to estimate size factors for all samples
+# IMPORTANT: Remove gene_name column if present to avoid matrix error
+combined_counts_clean <- combined_counts_plus %>% dplyr::select(-gene_name)
+rownames(combined_counts_clean) <- combined_counts_clean$gene_id
+combined_counts_clean <- combined_counts_clean[, -1] # Remove gene_id col
+
+# Filter for relevant timepoints
+keep_times <- c("0", "2", "4", "8", "16", "24", "48", "96")
+col_data_filt <- col_data[as.character(col_data$time) %in% keep_times, ]
+col_data_filt$time <- factor(as.character(col_data_filt$time), levels = keep_times)
+combined_counts_filt <- as.matrix(combined_counts_clean[, col_data_filt$sample_id])
+
+dds_norm <- DESeqDataSetFromMatrix(countData = combined_counts_filt,
+                                   colData = col_data_filt,
+                                   design = ~ 1) 
+dds_norm <- estimateSizeFactors(dds_norm)
+norm_counts_mat <- counts(dds_norm, normalized = TRUE)
+
+norm_counts_df <- as.data.frame(norm_counts_mat) %>%
+  rownames_to_column("gene_id") %>%
+  left_join(g2s, by = "gene_id")
+
+# Select 12 Core Genes
+collapse_genes <- c("NANOG", "MYC", "DNMT3B", "DPPA2", 
+                    "GDF3", "PRDM14", "TERF1", "UTF1", 
+                    "FOXD3", "HMOX1", "FOXO1", "KDR")
+
+plot_data_long <- norm_counts_df %>%
+  filter(gene_name %in% collapse_genes) %>% 
+  pivot_longer(cols = -c(gene_id, gene_name), names_to = "sample_id", values_to = "normalized_counts") %>%
+  left_join(col_data, by = "sample_id") %>%
+  mutate(time = as.numeric(as.character(time)))
+
+# Calculate stats
+plot_summary <- plot_data_long %>%
+  group_by(gene_name, time) %>%
+  summarise(
+    mean_expr = mean(normalized_counts, na.rm = TRUE),
+    se_expr = sd(normalized_counts, na.rm = TRUE) / sqrt(n()), 
+    .groups = "drop"
+  ) %>%
+  mutate(ymin = mean_expr - se_expr, ymax = mean_expr + se_expr)
+
+# Order genes
+plot_summary$gene_name <- factor(plot_summary$gene_name, levels = collapse_genes)
+
+# Plot
+p_hallmark <- ggplot(plot_summary, aes(x = time, y = mean_expr)) +
+  geom_ribbon(aes(ymin = ymin, ymax = ymax), fill = "#92C5DE", alpha = 0.6) +
+  geom_line(color = "#0571B0", linewidth = 0.75) + 
+  geom_point(color = "black", size = 1.5) +       
+  facet_wrap(~ gene_name, scales = "free_y", ncol = 4) + 
+  labs(
+    x = "Time (Hours)", 
+    y = "Normalized Counts (Mean ± SE)",
+    title = "Rapid Collapse of the Pluripotency Core Network"
+  ) +
+  theme_bw() +
+  scale_x_continuous(breaks = c(0, 4, 8, 24, 48, 96))
+
+ggsave("figures/fig1/Figure_Stemness_Collapse_12Genes.pdf", p_hallmark, height = 9, width = 12)
+```
+
+```{r pca_analysis}
+# Prepare data with Batch information
+col_data_filt$batch <- "batch1" 
+batch2_conditions <- c("TUG1210c3", "LINC00667c1b1", "LINC00667c2b1", "WT")
+col_data_filt$batch[col_data_filt$condition %in% batch2_conditions] <- "batch2"
+col_data_filt$batch <- as.factor(col_data_filt$batch)
+
+# Run VST
+dds_all <- DESeqDataSetFromMatrix(countData = combined_counts_filt,
+                                  colData = col_data_filt,
+                                  design = ~ time)
+vst_data <- vst(dds_all, blind = FALSE)
+mat <- assay(vst_data)
+
+# Remove Batch Effect
+mm <- model.matrix(~time, col_data_filt)
+mat_corrected <- removeBatchEffect(mat, batch = col_data_filt$batch, design = mm)
+
+# Run PCA
+pca <- prcomp(t(mat_corrected))
+percentVar <- round(100 * pca$sdev^2 / sum(pca$sdev^2))
+pcaData <- data.frame(PC1 = pca$x[,1], PC2 = pca$x[,2], 
+                      time = col_data_filt$time, 
+                      condition = col_data_filt$condition)
+
+# Plot
+ggplot(pcaData, aes(x = PC1, y = PC2, fill = as.numeric(time))) +
+  geom_point(size = 2.5, shape = 21) +
+  scale_fill_gradient2(
+    low = "#313695", mid = "#f7f7f7", high = "#a50026",
+    midpoint = median(as.numeric(pcaData$time)),
+    name = "Time (h)"
+  ) +
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+  theme_classic() +
+  ggtitle("Global Trajectory")
+
+ggsave("figures/fig1/PCA_Global_Trajectory.pdf", height = 5.5, width = 5)
+```
+
+```{r overlap analysis}
+# Define a helper function to process individual datasets based on our criteria
+# (Re-using logic from Chunk 4 but for individual subsets)
+filtered_results <- filtered_df %>%
+  inner_join(trend_summary[, c("condition", "gene_id")],
+             by = c("condition", "gene_id"))
+
+# Dynamic calculation of the total number of unique experimental conditions (clones)
+total_conditions <- n_distinct(filtered_results$condition)
+print(paste("Total clones/conditions:", total_conditions))
+
+# Assign the processed dataframe to a final variable for consistency
+# The 'condition' column is crucial and will not be cleaned or renamed
+data_full <- filtered_results
+
+# 函数：从条件名中提取基本名称
+extract_base_name <- function(cond_name) {
+  # 移除"c[数字]"前缀
+  base_name <- str_remove(cond_name, "c[0-9].*")
+  # 移除下划线后的部分
+  base_name <- str_remove(base_name, "_.*")
+  return(base_name)
+}
+
+# 自定义排序函数
+custom_order <- function(condition_names) {
+  # 提取每个条件的基本名称
+  base_names <- sapply(condition_names, extract_base_name)
+  
+  # 分离WT和GFP
+  wt_conditions <- condition_names[base_names == "WT"]
+  gfp_conditions <- condition_names[base_names == "GFP"]
+  
+  # 获取其他条件
+  other_conditions <- condition_names[!(base_names %in% c("WT", "GFP"))]
+  
+  # 对其他条件按基本名称字母排序
+  if (length(other_conditions) > 0) {
+    # 提取其他条件的基本名称
+    other_base_names <- sapply(other_conditions, extract_base_name)
+    # 按基本名称字母排序
+    other_conditions_sorted <- other_conditions[order(other_base_names)]
+  } else {
+    other_conditions_sorted <- character(0)
+  }
+  
+  # 合并：先WT，再GFP，然后其他按字母排序
+  return(c(wt_conditions, gfp_conditions, other_conditions_sorted))
+}
+
+# 获取所有唯一条件
+all_conditions <- unique(data_full$condition)
+
+# 应用自定义排序
+custom_order_vec <- custom_order(all_conditions)
+
+# 将condition转换为因子，应用自定义排序
+data_full$condition <- factor(data_full$condition, levels = custom_order_vec)
+
+# Calculate how many specific conditions (clones) each gene appears in
+# 使用提取的基本名称进行分析
+gene_counts <- data_full %>%
+  mutate(base_name = extract_base_name(condition)) %>%
+  group_by(gene_id) %>%
+  summarize(
+    n_conds = n_distinct(base_name),  # 基于基本名称计数
+    .groups = "drop"
+  ) %>%
+  # Assign each gene to a sharing category based on the percentage of total_conditions
+  mutate(
+    share_category = case_when(
+      n_conds == 1 ~ "Unique (Clone-Specific)",         # Appears in only one clone
+      n_conds <= total_conditions * 0.25 ~ "Low Shared (<25%)",   # Appears in <25% of clones
+      n_conds <= total_conditions * 0.50 ~ "Medium Shared (<50%)", # Appears in <50% of clones
+      n_conds <= total_conditions * 0.75 ~ "High Shared (<75%)",  # Appears in <75% of clones
+      TRUE ~ "Consistant Response (>=75%)"                       # Appears in >=75% of clones (Highly conserved)
+    )
+  )
+
+# 为了绘图，我们需要将原始条件名称与排序后的因子顺序对齐
+# 首先创建一个映射：条件 -> 基本名称
+condition_base_map <- data_full %>%
+  distinct(condition) %>%
+  mutate(base_name = extract_base_name(condition))
+
+summary_df <- data_full %>%
+  # Ensure only unique condition-gene_id pairs are counted (preventing double counting)
+  distinct(condition, gene_id) %>%
+  # Join the calculated sharing category for each gene
+  left_join(gene_counts, by = "gene_id") %>%
+  # Join base name for ordering
+  left_join(condition_base_map, by = "condition") %>%
+  # Group by condition and sharing category to count genes in each category
+  group_by(condition, share_category, base_name) %>%
+  summarize(gene_count = n(), .groups = "drop") %>%
+  # Calculate percentage within each condition
+  group_by(condition) %>%
+  mutate(
+    total_genes = sum(gene_count),
+    pct = gene_count / total_genes * 100 # Percentage of DEGs in this clone belonging to this category
+  ) %>%
+  # 确保condition保持正确的因子顺序
+  ungroup() %>%
+  mutate(condition = factor(condition, levels = custom_order_vec))
+
+# Set the desired order for the stacked bars (from most conserved to most specific)
+summary_df$share_category <- factor(summary_df$share_category,
+                                    levels = c("Consistant Response (>=75%)",
+                                               "High Shared (<75%)",
+                                               "Medium Shared (<50%)",
+                                               "Low Shared (<25%)",
+                                               "Unique (Clone-Specific)"))
+
+# --- 5. Generate Stacked Bar Plot ---
+ggplot(summary_df, aes(x = condition, y = pct, fill = share_category)) +
+  # Use geom_col for a standard stacked bar chart
+  geom_col(width = 0.78) +
+
+  # Define specific colors for each category (from dark/core to light/specific)
+  scale_fill_manual(
+    values = c(
+      "Consistant Response (>=75%)" = "#252525", # Black/Dark Gray: Highly Conserved Genes
+      "High Shared (<75%)"          = "#525252",
+      "Medium Shared (<50%)"        = "#737373",
+      "Low Shared (<25%)"           = "#969696",
+      "Unique (Clone-Specific)"     = "#2166AC"  # Blue: Unique Genes (Highlights Specificity)
+    )
+  ) +
+
+  # Set Y-axis limits and remove expansion/padding
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 100.1)) +
+
+  # Apply a clean, classic theme
+  theme_classic() +
+  # Set labels and title
+  labs(
+    x = NULL,
+    y = "Percentage of DEGs (%)",
+    fill = "Consistency",
+    title = "Conservation of Transcriptomic Response Across Cells/Clones"
+  ) +
+
+  # Customize plot elements for publication quality
+  theme(
+    # Rotate X-axis text for long clone names
+    axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, color = "black", size = 9.5),
+    axis.text.y = element_text(color = "black"),
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5, color = "grey50"),
+    legend.position = "bottom",
+    legend.title = element_text(face = "bold", size = 9),
+    legend.text = element_text(size = 8),
+    legend.key.size = unit(0.4, "cm")
+  )
+
+# Save the plot as a PDF file
+ggsave(
+  path = "~/RNAseq/RNAseq_FULL_MODEL/combined time/figures/fig2",
+  filename = "Conservation of Transcriptomic Response Across Cells.pdf",
+  height = 10, width = 15, limitsize = FALSE
+)
+
+process_df_subset <- function(df) {
+  df_filt <- df %>% filter(padj <= 0.01 & baseMean >= 20)
+  
+  maxfc <- df_filt %>% group_by(condition, gene_id) %>%
+    summarize(max_fc = log2FoldChange[which.max(abs(log2FoldChange))], .groups="drop")
+  
+  df_filt <- df_filt %>% left_join(maxfc) %>% filter(abs(max_fc) >= 1) %>%
+    mutate(up = log2FoldChange >= 0.58, down = log2FoldChange <= -0.58)
+  
+  valid_tps <- c(24, 48, 96)
+  trend <- df_filt %>% filter(timepoint %in% valid_tps) %>%
+    group_by(condition, gene_id) %>%
+    summarize(up_count=sum(up, na.rm=T), down_count=sum(down, na.rm=T), 
+              total=n(), .groups="drop") %>%
+    filter(total==3 & (up_count>=3 | down_count>=3))
+  
+  # Determine direction per gene
+  final <- trend %>% group_by(gene_id) %>%
+    summarise(n_up = sum(up_count > down_count), 
+              n_down = sum(down_count > up_count), .groups="drop")
+  return(final)
+}
+
+# 1. Extract raw results for specific groups
+gfp_df <- all_results_df %>% filter(grepl("GFP", condition))
+linc667_df <- all_results_df %>% filter(grepl("LINC00667", condition))
+tug1_df <- all_results_df %>% filter(grepl("TUG1", condition))
+wt_df <- all_results_df %>% filter(condition == "WT")
+
+# 2. Process them
+gfp_sig <- process_df_subset(gfp_df) %>% filter(n_up >= 3 | n_down >= 3)
+linc667_sig <- process_df_subset(linc667_df) %>% filter(n_up >= 3 | n_down >= 3)
+tug1_sig <- process_df_subset(tug1_df) %>% filter(n_up >= 1 | n_down >= 1)
+wt_sig <- process_df_subset(wt_df) # WT only has 1 replicate set typically
+
+# 3. Create UpSet Plot
+genes_list <- list(
+  GFP = unique(gfp_sig$gene_id),
+  LINC00667 = unique(linc667_sig$gene_id)
+)
+
+upset(fromList(genes_list), nsets = 4, text.scale = 1.5, 
+      mainbar.y.label = "Gene Intersections")
+
+# 4. Create Venn Diagram (using ggvenn)
+ggvenn(
+  genes_list,
+  fill_color = rep("white", length(genes_list)),
+  stroke_color = "black", 
+  stroke_size = 0.5
+) + labs(title = "Overlap of Significant Genes")
+```
+
+```{r heatmap_visualization_DRGs}
+# Fix Type Mismatch Error from previous attempts
+# Ensure timepoint is Character in both dataframes before binding
+
+# 1. Filter results for DRGs genes
+all_results_df_filtered <- all_results_df %>%
+  # Filter the main results dataframe to include only the genes of interest (DRGs)
+  filter(gene_id %in% sig_genes_21_to_28$gene_id) %>%
+  # Ensure the timepoint variable is character type to prevent mismatch when binding with "0"
+  mutate(timepoint = as.character(timepoint))
+
+# 2. Create Zero Timepoint (Baseline)
+zeros_df <- all_results_df_filtered %>%
+  # Create a unique row for every combination of condition and gene_id
+  distinct(condition, gene_id) %>%
+  # Assign timepoint "0" and set log2FoldChange to 0 (representing no change at baseline)
+  mutate(timepoint = "0", log2FoldChange = 0)
+
+# Define the intended order of timepoints for the X-axis
+target_timepoints <- c("0", "2", "4", "8", "16", "24", "48", "96")
+
+# 3. Bind and Summarise
+heatmap_data_compact <- bind_rows(all_results_df_filtered, zeros_df) %>%
+  # Keep only the timepoints defined in the target sequence
+  filter(timepoint %in% target_timepoints) %>%
+  # Aggregate (summarise) data: calculate the mean log2FC for each condition/gene/timepoint group
+  group_by(condition, gene_id, timepoint) %>%
+  summarise(log2FoldChange = mean(log2FoldChange, na.rm = TRUE), .groups = "drop") %>%
+  # Convert timepoint to an ordered factor to ensure correct X-axis visualization order
+  mutate(timepoint = factor(timepoint, levels = target_timepoints))
+
+# 从condition中提取基本名称用于排序（但不创建新列）
+# 函数：从条件名中提取基本名称
+extract_base_name <- function(cond_name) {
+  # 移除"c[数字]"前缀
+  base_name <- str_remove(cond_name, "c[0-9].*")
+  # 移除下划线后的部分
+  base_name <- str_remove(base_name, "_.*")
+  return(base_name)
+}
+
+# 获取所有条件的基本名称
+base_names <- sapply(unique(heatmap_data_compact$condition), extract_base_name)
+names(base_names) <- unique(heatmap_data_compact$condition)
+
+# 自定义排序函数
+custom_order <- function(condition_names) {
+  # 提取每个条件的基本名称
+  base_names <- sapply(condition_names, extract_base_name)
+  
+  # 分离WT和GFP
+  wt_conditions <- condition_names[base_names == "WT"]
+  gfp_conditions <- condition_names[base_names == "GFP"]
+  
+  # 获取其他条件
+  other_conditions <- condition_names[!(base_names %in% c("WT", "GFP"))]
+  
+  # 对其他条件按基本名称字母排序
+  if (length(other_conditions) > 0) {
+    # 提取其他条件的基本名称
+    other_base_names <- sapply(other_conditions, extract_base_name)
+    # 按基本名称字母排序
+    other_conditions_sorted <- other_conditions[order(other_base_names)]
+  } else {
+    other_conditions_sorted <- character(0)
+  }
+  
+  # 合并：先WT，再GFP，然后其他按字母排序
+  return(c(wt_conditions, gfp_conditions, other_conditions_sorted))
+}
+
+# 获取所有唯一条件
+all_conditions <- unique(heatmap_data_compact$condition)
+
+# 应用自定义排序
+custom_order_vec <- custom_order(all_conditions)
+
+# 将condition转换为因子，应用自定义排序
+heatmap_data_compact$condition <- factor(heatmap_data_compact$condition, levels = custom_order_vec)
+
+# --- Steps for Clustering and Ordering ---
+# Calculate the average expression trajectory across ALL conditions for each gene
+gene_avg_matrix <- heatmap_data_compact %>%
+  group_by(gene_id, timepoint) %>%
+  summarise(mean_fc = mean(log2FoldChange, na.rm = TRUE), .groups = "drop") %>%
+  # Pivot to a wide format (rows=genes, columns=timepoints) for distance calculation
+  pivot_wider(names_from = timepoint, values_from = mean_fc) %>%
+  column_to_rownames("gene_id")
+
+gene_avg_matrix[is.na(gene_avg_matrix)] <- 0 # Defensive step: replace NA values with 0
+gene_dist <- dist(gene_avg_matrix)           # Calculate Euclidean distance between gene trajectories
+gene_hclust <- hclust(gene_dist, method = "complete") # Perform Hierarchical Clustering
+gene_order <- rownames(gene_avg_matrix)[gene_hclust$order] # Extract the clustered gene order
+
+# Apply the calculated gene order to the main plotting dataframe (Y-axis factor level)
+heatmap_data_compact$gene_id <- factor(heatmap_data_compact$gene_id, levels = gene_order)
+
+# 4. Plot
+ggplot(heatmap_data_compact, aes(x = timepoint, y = gene_id, fill = log2FoldChange)) +
+  # geom_tile creates the heatmap squares
+  # linewidth = 0 is a critical optimization to remove thin white borders in PDF output
+  geom_tile(linewidth = 0) +
+
+  # Define a custom color gradient (Blue-Black-Red style)
+  scale_fill_gradientn(
+    # Colors: Downregulated (Blue) -> Zero (Faded/Near White) -> Upregulated (Red)
+    colours = c("#2166ac", "#67a9cf", "#fddbc7", "#ef8a62", "#b2182b"),
+    # Map colors to specific log2FC values
+    values = scales::rescale(c(-2, -1, 0, 1, 2)),
+    # Set the fixed color scale limits
+    limits = c(-2, 2),
+    name = "log2FC",
+    # Clamp values outside limits to the boundary colors
+    oob = scales::squish
+  ) +
+
+  # Use facet_grid to split the plot by condition (clones)
+  # scales = "free_x" and space = "free_x" ensure facets share space proportional to their data/names (if needed)
+  facet_grid(~ condition, scales = "free_x", space = "free_x") +
+
+  theme_minimal(base_size = 12) + # Start with a clean theme
+  theme(
+    # X-axis labels: Rotated for readability of timepoints
+    axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 8, color = "black"),
+    # Hide Y-axis text (gene IDs) as the order is based on clustering
+    axis.text.y = element_blank(),
+    axis.ticks = element_blank(),
+
+    # Remove all background grids for a clean, high-contrast look
+    panel.grid = element_blank(),
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background = element_rect(fill = "white", color = NA),
+
+    # Facet strip optimization: Bold text, rotation, and light background
+    strip.text = element_text(face = "bold", size = 12, angle = 90),
+    strip.background = element_rect(fill = "grey95", color = NA),
+
+    # Minimize the spacing between facets to make the plot appear continuous
+    panel.spacing = unit(0.05, "lines")
+  ) +
+  # Set titles and axis labels
+  labs(
+    title = "Conserved Transcriptional Trajectory (High Contrast)",
+    x = "Time (h)",
+    y = paste0("Genes (n=", length(unique(heatmap_data_compact$gene_id)), ")")
+  )
+
+# Save the plot as a PDF file with specified dimensions
+ggsave("~/RNAseq/RNAseq_FULL_MODEL/combined time/figures/fig2/Combined_Heatmap_Compact2.pdf",
+       width = 16, height = 5, limitsize = FALSE)
+```
+
+```{r enrichment_analysis}
+# Set a publication-grade theme for ggplot2
+theme_pub <- function() {
+  theme_classic(base_size = 14) +
+    theme(
+      axis.text = element_text(color = "black"),
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      legend.position = "right",
+      strip.background = element_rect(fill = "grey95")
+    )
+}
+
+# Define and create output directory
+output_dir <- "~/RNAseq/RNAseq_FULL_MODEL/combined time/figures/fig2/Enrichment_Publication/"
+if(!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+
+# 1. DATA PREPARATION (ID Conversion)
+message("Preparing gene IDs...")
+
+# A. Target Genes (Differentially Expressed Genes)
+# Assume 'sig_genes_21_to_28' is the dataframe of DEGs
+target_genes_df <- sig_genes_21_to_28
+# Clean ENSEMBL IDs by removing version numbers (e.g., ENSG00000XXX.Y -> ENSG00000XXX)
+target_genes_df$gene_id_clean <- gsub("\\..*", "", target_genes_df$gene_id)
+
+# Convert ENSEMBL to ENTREZID (for clusterProfiler) and SYMBOL (for readability/enrichR)
+gene_convert <- bitr(target_genes_df$gene_id_clean,
+                     fromType = "ENSEMBL",
+                     toType = c("ENTREZID", "SYMBOL"),
+                     OrgDb = org.Hs.eg.db)
+
+target_entrez <- unique(gene_convert$ENTREZID)
+target_symbol <- unique(gene_convert$SYMBOL)
+
+# B. Background Genes (Universe) - Required for statistical rigor in GO/ORA
+# Filter for genes passing an expression threshold (e.g., baseMean >= 20)
+universe_df <- all_results_df %>% filter(baseMean >= 20)
+universe_df$gene_id_clean <- gsub("\\..*", "", universe_df$gene_id)
+
+# Convert the background gene list to ENTREZID
+universe_convert <- bitr(universe_df$gene_id_clean,
+                         fromType = "ENSEMBL",
+                         toType = "ENTREZID",
+                         OrgDb = org.Hs.eg.db)
+universe_entrez <- unique(universe_convert$ENTREZID)
+
+message(paste("Target gene count (ENTREZID):", length(target_entrez)))
+message(paste("Background gene count (ENTREZID):", length(universe_entrez)))
+
+# 2. GO ENRICHMENT ANALYSIS (using clusterProfiler + Custom Universe)
+message("Running GO enrichment analysis...")
+
+# Function to run enrichGO for a specified ontology (BP or CC)
+run_go <- function(ont) {
+  enrichGO(gene          = target_entrez,      # Target gene list
+           universe      = universe_entrez,    # Custom background (universe) gene list
+           OrgDb         = org.Hs.eg.db,       # Organism database (Human)
+           ont           = ont,                # Ontology: "BP" or "CC"
+           pAdjustMethod = "BH",               # Multiple testing correction
+           pvalueCutoff  = 0.05,               # P-value cutoff for filtering
+           qvalueCutoff  = 0.2,                # Q-value cutoff (qvalue < 0.2 is common for GO)
+           readable      = TRUE)               # Convert ENTREZID back to SYMBOL
+}
+
+ego_BP <- run_go("BP") # Biological Process
+ego_CC <- run_go("CC") # Cellular Component
+
+# Convert the enrichment results (S4 object) to a standard data frame
+go_results_df <- as.data.frame(ego_BP)
+
+# Filter the results to include only statistically significant terms (padj < 0.05)
+significant_terms_df <- go_results_df %>%
+  filter(p.adjust < 0.05) %>%
+  # Arrange the results by adjusted p-value for presentation
+  arrange(p.adjust)
+
+  # --- Export to CSV ---
+  output_filename <- paste0(output_dir, "Significant_GO_BP_Terms_p05.csv")
+  
+  # Export the data frame to a CSV file
+  write.csv(
+    significant_terms_df,
+    output_filename,
+    row.names = FALSE
+  )
+# --- GO Visualization (Dot Plot) ---
+# Creates a dot plot where size represents gene count and color represents adjusted P-value
+
+plot_go_dot <- function(ego, title) {
+  dotplot(ego, showCategory = 15) +
+    ggtitle(title) +
+    # Custom color gradient (e.g., NPG style Red to Blue)
+    scale_color_gradient(low = "#E64B35", high = "#3C5488") +
+    theme_pub()
+}
+
+p_bp <- plot_go_dot(ego_BP, "GO Biological Process (Dox Response)")
+p_cc <- plot_go_dot(ego_CC, "GO Cellular Component (Dox Response)")
+
+# Save plots
+ggsave(paste0(output_dir, "GO_BP_Dotplot.pdf"), p_bp, width = 9, height = 8)
+ggsave(paste0(output_dir, "GO_CC_Dotplot.pdf"), p_cc, width = 9, height = 8)
+
+# --- GO Visualization (Network Plot - Cnetplot) ---
+# Shows the relationship between enriched pathways and the genes that overlap between them
+p_cnet <- cnetplot(ego_BP, showCategory = 5, circular = FALSE, colorEdge = TRUE,
+                   cex_label_category = 1.2, cex_label_gene = 0.8) +
+  ggtitle("Gene-Pathway Interaction")
+
+ggsave(paste0(output_dir, "GO_BP_Network.pdf"), p_cnet, width = 12, height = 8)
+
+# 3. DIRECTIONAL ANALYSIS AND EXPORT
+
+# --- Prepare Log2FC Vector ---
+fc_column_name <- "log2FoldChange"
+
+# 1. Extract Symbol and Log2FC (Assuming log2FoldChange is a column in target_genes_df)
+gene_fc_info <- target_genes_df %>%
+  dplyr::select(gene_id_clean, all_of(fc_column_name)) %>%
+  # Join with the ID conversion table to map Ensembl to Symbol
+  left_join(gene_convert, by = c("gene_id_clean" = "ENSEMBL")) %>%
+  filter(!is.na(SYMBOL)) %>%
+  distinct(SYMBOL, .keep_all = TRUE) # Keep distinct symbols (resolves multi-mapping issues)
+
+# 2. Build the named vector required for analysis (Symbol as names, log2FC as values)
+gene_fc_vector <- gene_fc_info[[fc_column_name]]
+names(gene_fc_vector) <- gene_fc_info$SYMBOL
+
+# Sort the vector (Optional, but good practice for visual inspection)
+gene_fc_vector <- sort(gene_fc_vector, decreasing = TRUE)
+
+# --- Define Direction Counting Function ---
+# This function determines the number of up/down-regulated genes within a pathway
+count_direction <- function(gene_str, fc_vec) {
+  # Split the geneID string (e.g., "GENE_A/GENE_B")
+  genes <- unlist(strsplit(gene_str, "/"))
+
+  # Get log2FC values for these genes
+  fcs <- fc_vec[genes]
+  fcs <- fcs[!is.na(fcs)] # Remove non-matched genes
+
+  n_up <- sum(fcs > 0)
+  n_down <- sum(fcs < 0)
+
+  return(c(n_up, n_down))
+}
+
+# --- Apply Direction Counting and Classification ---
+res_df <- as.data.frame(ego_BP) # Get the BP results table
+
+# Create new columns
+res_df$Count_Up <- 0
+res_df$Count_Down <- 0
+res_df$Direction_Status <- ""
+
+# Loop through each enriched pathway to calculate direction counts
+for(i in 1:nrow(res_df)) {
+  counts <- count_direction(res_df$geneID[i], gene_fc_vector)
+  res_df$Count_Up[i] <- counts[1]
+  res_df$Count_Down[i] <- counts[2]
+
+  # Classification logic: Pathway is directional if one direction count is more than double the other
+  if (counts[1] > counts[2] * 2) {
+    res_df$Direction_Status[i] <- "Activated (Mostly Up)"
+  } else if (counts[2] > counts[1] * 2) {
+    res_df$Direction_Status[i] <- "Suppressed (Mostly Down)"
+  } else {
+    res_df$Direction_Status[i] <- "Mixed" # Both up and down genes are represented
+  }
+}
+
+# --- Final Table Export ---
+final_table <- res_df %>%
+  # Select and reorder relevant columns for clarity
+  dplyr::select(Description, p.adjust, Count, Count_Up, Count_Down, Direction_Status, geneID) %>%
+  filter(p.adjust < 0.05) %>% # Ensure only statistically significant pathways are exported
+  arrange(p.adjust)          # Sort by adjusted P-value
+
+# Export the final table with directional information
+write.csv(final_table, paste0(output_dir, "Full_GO_Pathways_With_Direction.csv"), row.names = FALSE)
+
+```
+
+```{r gsea_analysis}
+
+# 1: PREPARE CUSTOM GENE SIGNATURE
+# Read your core list of significant genes
+final_sig_genes <- read.csv("~/RNAseq/RNAseq_FULL_MODEL/combined time/results/final_sig_genes_log2fc1.csv", row.names = 1)
+
+# Helper function to remove Ensembl ID version numbers (e.g., ENSG00000XXX.Y -> ENSG00000XXX)
+trim_version <- function(x) sub("\\.\\d+$", "", x)
+
+# Extract and clean gene IDs for the UP-regulated component (n_up >= 21 timepoints)
+n_up <- final_sig_genes %>%
+  filter(!is.na(n_up), n_up >= 21) %>%
+  pull(gene_id) %>%
+  as.character() %>%
+  trim_version() %>%
+  unique()
+
+# Extract and clean gene IDs for the DOWN-regulated component
+n_down <- final_sig_genes %>%
+  filter(!is.na(n_down), n_down >= 21) %>%
+  pull(gene_id) %>%
+  as.character() %>%
+  trim_version() %>%
+  unique()
+
+# Construct the custom gene set list for fgsea
+my_signature <- list(
+  My_UP_Stress = n_up,
+  My_DOWN_Collapse = n_down
+)
+
+# Optional function to save the signature as a GMT file
+write_gmt <- function(gene_list, file){
+  con <- file(file, "w")
+  on.exit(close(con))
+  for (gs_name in names(gene_list)) {
+    cat(gs_name, "NA", paste(gene_list[[gs_name]], collapse = "\t"),
+        sep = "\t", file = con)
+    cat("\n", file = con)
+  }
+}
+# write_gmt(my_signature, "my_signature.gmt") 
+
+# 2: LOAD PUBLIC DATA AND PROCESS IDs
+
+df <- read.table(
+  "~/RNAseq/RNAseq_FULL_MODEL/combined time/figures/fig5/PSC/GSE236795_raw_counts_GRCh38.p13_NCBI.tsv",
+  header = TRUE, row.names = 1, sep = "\t", check.names = FALSE
+)
+
+# Remove non-count columns (assuming first 8 columns are metadata)
+# NOTE: Check your file structure to ensure -c(1:8) is correct
+colnames(df)
+df<-df[, -c(1:8)]
+colnames(df)
+
+# --- ID CONVERSION (NCBI Entrez ID -> Ensembl ID) ---
+ncbi_ids <- rownames(df)
+
+# Map Entrez IDs (keytype) to Ensembl IDs (column)
+mapped_ids <- mapIds(org.Hs.eg.db,
+                     keys = ncbi_ids,
+                     column = "ENSEMBL",
+                     keytype = "ENTREZID",
+                     multiVals = "first") # Take the first mapping in case of one-to-many
+
+# Add the Ensembl IDs as a new column
+df$ensembl_id <- mapped_ids
+
+# --- Handle ID Ambiguity (Filtering and Aggregation) ---
+# Remove rows where no Ensembl ID was mapped
+df_clean <- df[!is.na(df$ensembl_id), ]
+
+# Aggregate counts for multiple NCBI IDs mapping to the same Ensembl ID (sum counts)
+df_aggregated <- df_clean %>%
+  group_by(ensembl_id) %>%
+  # Summarize by summing counts across all sample columns
+  summarise(across(where(is.numeric), sum)) %>%
+  as.data.frame()
+
+# Set Ensembl ID as row names and finalize the count matrix
+rownames(df_aggregated) <- df_aggregated$ensembl_id
+df_final <- df_aggregated[, -1] # Remove the redundant ensembl_id column
+
+# 3: DESeq2 ANALYSIS
+
+# Manually define conditions vector (CRITICAL: MUST match colnames(df_final) order)
+conditions_vec <- c("treatment","control", "control", "treatment", "treatment","control", "control", "treatment", "treatment","control", "control")
+
+# Check for sample count mismatch
+if(length(conditions_vec) != ncol(df_final)) {
+  stop("ERROR: The number of defined sample conditions does not match the number of data columns!")
+}
+
+# Create the sample metadata dataframe (colData)
+sample_info <- data.frame(
+  condition = factor(conditions_vec, levels = c("control", "treatment")), # Set 'control' as the reference level
+  row.names = colnames(df_final)
+)
+
+# Construct DESeq object
+dds <- DESeqDataSetFromMatrix(
+  countData = round(df_final), # DESeq2 requires integer counts
+  colData = sample_info,
+  design = ~ condition
+)
+
+# --- Run DESeq (using the default Wald Test for two-group comparison) ---
+dds <- DESeq(dds)
+
+# Extract results, explicitly defining the contrast: Treatment vs. Control
+res <- results(dds, contrast = c("condition", "treatment", "control"))
+
+# 4 & 5: PREPARE RANKING AND RUN GSEA
+
+# Use the Wald Statistic ('stat') for ranking (more robust than log2FC in GSEA)
+rnk_vec <- res$stat
+names(rnk_vec) <- rownames(res)
+
+# Remove NA values and sort the vector
+rnk_vec <- rnk_vec[!is.na(rnk_vec)]
+# Add a small noise to handle ties (important for GSEA algorithm)
+noise <- runif(length(rnk_vec), min = -1e-10, max = 1e-10)
+rnk_vec <- rnk_vec + noise
+rnk_vec <- sort(rnk_vec, decreasing = TRUE)
+
+# Optional: Save the ranked list (.rnk file format)
+rnk_df <- data.frame(Gene = names(rnk_vec), Score = rnk_vec)
+# write.table(rnk_df, "public_data_ranking.rnk", sep="\t", quote=FALSE, row.names=FALSE)
+
+# --- Run fgsea ---
+set.seed(42) # Ensure reproducibility
+
+fgseaRes <- fgsea(
+  pathways = my_signature,        # Your custom gene sets
+  stats    = rnk_vec,             # The ranked list
+  minSize  = 5,                    # Minimum gene set size (set lower for small signatures)
+  maxSize  = 500
+)
+
+# View and print final results
+print(fgseaRes[order(fgseaRes$padj), ])
+
+# 6: VISUALIZATION
+# Helper function to plot GSEA results and add statistical labels
+plot_gsea_custom <- function(pathway_id, stats_vec, title_text) {
+  # Get NES and Padj values for labeling
+  res_row <- fgseaRes[fgseaRes$pathway == pathway_id, ]
+  stats_label <- paste0("NES: ", round(res_row$NES, 2), "\nPadj: ", formatC(res_row$padj, format = "e", digits = 2))
+
+  plotEnrichment(my_signature[[pathway_id]], stats_vec) +
+    labs(title = title_text, subtitle = stats_label) +
+    theme_bw() +
+    theme(plot.title = element_text(face = "bold", hjust = 0.5))
+}
+
+# Plot UP component (expect positive NES if similar response)
+p1 <- plot_gsea_custom("My_UP_Stress", rnk_vec, "GSE236795: Enrichment of DOX UP Signature")
+
+# Plot DOWN component (expect negative NES if similar response)
+p2 <- plot_gsea_custom("My_DOWN_Collapse", rnk_vec, "GSE236795: Enrichment of DOX DOWN Signature")
+
+# Combine plots
+combined_plot <- grid.arrange(p1, p2, ncol = 2)
+
+# Save combined plot
+ggsave(
+  "~/RNAseq/RNAseq_FULL_MODEL/combined time/figures/fig5/PSC/GSE236795_GSEA_Result_PublicData.pdf",
+  combined_plot,
+  width = 12, height = 6
+)
+
+# 7: AGGREGATE RESULTS FOR BUBBLE MATRIX
+
+# Initialize summary table (if it doesn't exist from previous runs)
+if (!exists("gsea_summary_df")) {
+  gsea_summary_df <- data.frame(
+    dataset = character(),
+    pathway = character(),
+    NES = numeric(),
+    pval = numeric(),
+    padj = numeric(),
+    size = integer(),
+    leadingEdge = character(),
+    stringsAsFactors = FALSE
+  )
+}
+
+current_dataset <- "GSE236795"
+current_condition <- "treatment_vs_control"
+
+# Add current results to the summary table
+for (i in 1:nrow(fgseaRes)) {
+  pathway_result <- fgseaRes[i, ]
+
+  # Convert leadingEdge list to a semicolon-separated string
+  leading_edge_str <- paste(pathway_result$leadingEdge[[1]], collapse = ";")
+
+  new_row <- data.frame(
+    dataset = current_dataset,
+    pathway = pathway_result$pathway,
+    NES = pathway_result$NES,
+    pval = pathway_result$pval,
+    padj = pathway_result$padj,
+    size = pathway_result$size,
+    leadingEdge = leading_edge_str,
+    stringsAsFactors = FALSE
+  )
+
+  gsea_summary_df <- rbind(gsea_summary_df, new_row)
+}
+
+# Save the cumulative summary dataframe
+save(gsea_summary_df, file = "~/RNAseq/RNAseq_FULL_MODEL/combined time/figures/fig5/my_signature_gsea_summary_df.RData")
+
+# 9: FORMAT DATA FOR BUBBLE MATRIX
+
+# Mapping of GEO IDs (Dataset names) to Cell Types
+cell_type_map <- list(
+  "Stem Cell" = c("159778", "161634", "171803", "204934", "236795", "251814", "260618"),
+  "HCT116"    = c("62889", "73317", "114946", "121207", "158672", "234395"),
+  "HEK293"    = c("100132", "142895", "205721", "208379", "219008", "221838"),
+  "HeLa"      = c("201019", "271430"),
+  "MCF-7"     = c("128458", "175401")
+)
+
+# Robust function to assign Cell Type based on dataset name (using partial ID match)
+get_cell_type_robust <- function(dataset_name) {
+  for (type in names(cell_type_map)) {
+    ids <- cell_type_map[[type]]
+    # Check if the dataset_name contains any of the mapped GEO IDs
+    if (any(sapply(ids, function(id) grepl(id, dataset_name)))) {
+      return(type)
+    }
+  }
+  return("Other Type") # Default for unmapped datasets
+}
+
+# Process the aggregated data for plotting
+plot_data <- gsea_summary_df %>%
+  rowwise() %>%
+  mutate(Cell_Type = get_cell_type_robust(dataset)) %>% # Assign Cell Type
+  ungroup() %>%
+  mutate(log_pval = -log10(padj)) %>%
+  # Cap the -log10(padj) value to prevent 'Inf' issues in scaling
+  mutate(log_pval = ifelse(is.infinite(log_pval), 50, log_pval)) %>%
+  mutate(sig_label = ifelse(padj < 0.05, "*", "")) %>% # Create significance asterisk label
+  # Clean up pathway names for the plot Y-axis
+  mutate(pathway_label = case_when(
+    pathway == "My_DOWN_Collapse" ~ "Stemness Collapse (Down)",
+    pathway == "My_UP_Stress" ~ "Stress/De-repression (Up)",
+    TRUE ~ pathway
+  ))
+
+# Set factor levels for correct ordering on the plot
+plot_data$Cell_Type <- factor(plot_data$Cell_Type,
+                              levels = c("Stem Cell", "HCT116", "HEK293", "HeLa", "MCF-7", "Other Type"))
+
+plot_data$pathway_label <- factor(plot_data$pathway_label,
+                                  levels = c("Stress/De-repression (Up)", "Stemness Collapse (Down)"))
+
+# Step 10: DRAW BUBBLE MATRIX
+p_bubble_guided <- ggplot(plot_data, aes(x = dataset, y = pathway_label)) +
+
+  # --- Vertical Guide Lines ---
+  # These lines visually connect the paired UP/DOWN pathways for each dataset
+  geom_line(aes(group = dataset), color = "grey80", linewidth = 0.5) +
+
+  # 1. Bubble Layer: size = significance, fill = NES
+  geom_point(aes(fill = NES, size = log_pval),
+             shape = 21,
+             color = "grey30",
+             stroke = 0.3) +
+
+  # 2. Color Scale: Diverging RdBu palette for NES
+  scale_fill_distiller(palette = "RdBu", direction = -1,
+                       limits = c(-3, 3), oob = scales::squish,
+                       name = "NES") +
+
+  # 3. Size Scale: Map -log10(FDR) to bubble size
+  scale_size(range = c(3, 12), name = "-log10(FDR)") +
+
+  # 4. Significance Text Layer
+  geom_text(aes(label = sig_label), vjust = 0.78, size = 6, color = "black") +
+
+  # 5. Facet: Separate the plot by Cell Type
+  facet_grid(~ Cell_Type, scales = "free_x", space = "free_x") +
+
+  # 6. Theme and Labels
+  theme_bw(base_size = 14) +
+  labs(
+    x = "Independent Datasets",
+    y = NULL,
+    title = "Specificity of Stemness Collapse to Pluripotent Cells",
+    subtitle = "Vertical lines indicate paired pathways for each independent dataset"
+  ) +
+  theme(
+    # Hide X-axis labels as the vertical lines serve as visual identifiers for datasets
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+
+    # Y-axis text
+    axis.text.y = element_text(face = "bold", color = "black"),
+
+    # Remove default grid lines
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+
+    # Facet strip customization
+    strip.background = element_rect(fill = "white", color = "black", linewidth = 0.5),
+    strip.text = element_text(face = "bold", size = 11),
+
+    legend.position = "right",
+    panel.spacing = unit(0.2, "lines")
+  )
+
+print(p_bubble_guided)
+
+# Save the final bubble matrix
+ggsave(
+  filename = "~/RNAseq/RNAseq_FULL_MODEL/combined time/figures/fig5/Fig5_Bubble_Final.pdf",
+  plot = p_bubble_guided,
+  width = 13, height = 5
+)
+```
+
+sessionInfo()
