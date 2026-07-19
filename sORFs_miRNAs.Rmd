@@ -1,0 +1,503 @@
+---
+title: "10.Reviews"
+author: "Iza"
+date: "2026-07-17"
+output: html_document
+---
+
+Ribo-seq ORFs
+```{r}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(httr)
+  library(jsonlite)
+})
+
+out_dir <- "R2C2_out"
+
+gencode_bed_files <- c(
+  phase1_v35 = "db/Ribo-seq_ORFs.all.bed",
+  phase2_v45 = "db/Ribo-seq_ORFs.comprehensive.bed"
+)
+
+use_sorfs_api    <- FALSE
+sorfs_csv_export <- "db/sorfs_human_export.csv"
+
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+```
+
+The 17 lncRNA isoforms
+```{r}
+lnc17 <- tribble(
+  ~lncrna,          ~ensg,               ~enst,
+  "BANCR",          "ENSG00000278910",   "ENST00000624238.3",
+  "CRNDE",          "ENSG00000245694",   "ENST00000502066.7",
+  "DANCR",          "ENSG00000226950",   "ENST00000441504.2",
+  "FENDRR",         "ENSG00000268388",   "ENST00000595886.1",
+  "HAGLR",          "ENSG00000224189",   "ENST00000416928.8",
+  "HEIH",           "ENSG00000278970",   "ENST00000623091.2",
+  "HULC",           "ENSG00000285219",   "ENST00000503668.2",
+  "LINC00667",      "ENSG00000263753",   "ENST00000668807.1",
+  "LINC00847",      "ENSG00000245060",   "ENST00000653584.1",
+  "LINC01547",      "ENSG00000183250",   "ENST00000667826.1",
+  "LINC-PINT",      "ENSG00000231721",   "ENST00000451786.6",
+  "LINC-ROR",       "ENSG00000258609",   "ENST00000553704.3",
+  "LNCPRESS1",      "ENSG00000232301",   "ENST00000429254.3",
+  "PNKY",           "ENSG00000283010",   "ENST00000635423.1",
+  "RP11-1055B8.4",  "ENSG00000262877",   "ENST00000571724.3",
+  "TUG1-210",       "ENSG00000253352",   "ENST00000643071.1",
+  "TUG1-217",       "ENSG00000253352",   "ENST00000644773.3"
+) %>%
+  mutate(enst_base = str_remove(enst, "\\.\\d+$"),
+         ensg_base = str_remove(ensg, "\\.\\d+$"))
+```
+
+Read GENCODE ORFs
+```{r}
+# add this line to your config block
+gencode_gtf <- "gencode.v43.annotation.gff3.gz" 
+
+# --- (a) exons dos 17 ENSTs, do GFF3 v38 local ------------------------------
+get_isoform_exons <- function(gff_path, ensts) {
+  stopifnot(file.exists(gff_path))
+  message("  lendo exons do GFF3: ", basename(gff_path))
+  g  <- rtracklayer::import(gff_path)
+  ex <- g[g$type == "exon"]
+  if (length(ex) == 0) stop("nenhum exon no GFF")
+  ex$enst_base <- sub("\\.\\d+$", "", ex$transcript_id)
+  want <- sub("\\.\\d+$", "", ensts)
+  ex <- ex[ex$enst_base %in% want]
+  if (length(ex) == 0) stop("nenhum dos 17 ENSTs achado no GFF")
+  split(ex, ex$enst_base)
+}
+
+# --- (b) blocos de exon dos ORFs, expandidos do BED12 -----------------------
+# BED12: X1 chrom, X2 start(0-based), X3 end, X4 name, X5 score, X6 strand,
+#   X7 thickStart, X8 thickEnd, X9 rgb, X10 blockCount,
+#   X11 blockSizes(csv), X12 blockStarts(csv, relativo a X2)
+read_orf_blocks <- function(path) {
+  if (is.na(path) || !file.exists(path)) {
+    message("  [skip] nao encontrado: ", path); return(NULL)
+  }
+  message("  lendo ORF BED12: ", basename(path))
+  b <- readr::read_tsv(path, col_names = FALSE, show_col_types = FALSE,
+                       col_types = cols(.default = "c"), comment = "#")
+
+  chrom  <- b$X1
+  start0 <- as.numeric(b$X2)
+  strand <- b$X6
+  name   <- b$X4
+  bcount <- suppressWarnings(as.integer(b$X10))
+  bsizes <- b$X11
+  bstarts<- b$X12
+
+  nm_parts <- str_split(name, ":")
+  orf_id   <- map_chr(nm_parts, ~ .x[1] %||% NA_character_)
+  orf_type <- map_chr(nm_parts, ~ if (length(.x) >= 3) tail(.x, 1) else NA_character_)
+
+  gr_list <- lapply(seq_len(nrow(b)), function(i) {
+    nb <- bcount[i]
+    if (is.na(nb) || nb < 1) {
+      sizes  <- as.numeric(b$X3[i]) - start0[i]
+      starts <- 0
+    } else {
+      sizes  <- as.numeric(str_split(bsizes[i], ",")[[1]] %>% .[. != ""])
+      starts <- as.numeric(str_split(bstarts[i], ",")[[1]] %>% .[. != ""])
+    }
+    GRanges(seqnames = chrom[i],
+            ranges  = IRanges(start = start0[i] + starts + 1, width = sizes),
+            strand  = strand[i],
+            orf_row = i, orf_id = orf_id[i],
+            orf_type = orf_type[i], source = basename(path))
+  })
+  do.call(c, gr_list)
+}
+```
+
+overlap exon blocks
+```{r}
+iso_exons  <- get_isoform_exons(gencode_gtf, lnc17$enst)
+
+orf_list <- map(gencode_bed_files, read_orf_blocks) %>% discard(is.null)
+stopifnot(length(orf_list) > 0)
+orf_blocks <- Reduce(c, unname(orf_list))
+stopifnot(is(orf_blocks, "GRanges"))
+GenomeInfoDb::seqlevelsStyle(orf_blocks) <- "UCSC"
+
+hit_rows <- map_dfr(names(iso_exons), function(eb) {
+  ex <- iso_exons[[eb]]
+  GenomeInfoDb::seqlevelsStyle(ex) <- "UCSC"
+
+  # número do exon como aparece no GFF3 (fallback pro índice ao longo do transcrito)
+  exn <- ex$exon_number
+  if (is.null(exn)) exn <- as.character(seq_along(ex))
+  exid <- ex$exon_id %||% rep(NA_character_, length(ex))
+
+  ov <- findOverlaps(orf_blocks, ex, ignore.strand = FALSE)
+  if (length(ov) == 0) return(NULL)
+
+  qi <- queryHits(ov); si <- subjectHits(ov)
+  tibble(
+    enst_base   = eb,
+    orf_id      = orf_blocks$orf_id[qi],
+    orf_type    = orf_blocks$orf_type[qi],
+    source      = orf_blocks$source[qi],
+    exon_number = exn[si],
+    exon_id     = exid[si]
+  ) %>% distinct()
+})
+
+# uma linha por (lncRNA, ORF), colapsando os exons que aquele ORF toca
+gencode_hits <- hit_rows %>%
+  group_by(enst_base, orf_id, orf_type, source) %>%
+  summarise(exons = paste(sort(unique(as.integer(exon_number))), collapse = ","),
+            .groups = "drop") %>%
+  left_join(lnc17 %>% select(lncrna, enst, enst_base), by = "enst_base") %>%
+  mutate(match_level = "isoform_exon_overlap")
+```
+
+Summary
+```{r}
+orf_summary <- lnc17 %>% dplyr::select(lncrna, enst, ensg) %>%
+  left_join(
+    if (nrow(gencode_hits) > 0)
+      gencode_hits %>% group_by(lncrna) %>%
+        summarise(gencode_orf_n = n(),
+                  gencode_orf_types = paste(sort(unique(na.omit(orf_type))),
+                                            collapse = ";"),
+                  gencode_exons = paste(sort(unique(as.integer(
+                                    unlist(str_split(exons, ","))))),
+                                    collapse = ","),
+                  gencode_sources = paste(sort(unique(source)), collapse = ";"),
+                  .groups = "drop")
+    else tibble(lncrna = character(), gencode_orf_n = integer(),
+                gencode_orf_types = character(), gencode_exons = character(),
+                gencode_sources = character()),
+    by = "lncrna") %>%
+  mutate(gencode_orf_n = coalesce(gencode_orf_n, 0L),
+         has_translated_orf = gencode_orf_n > 0) %>%
+  arrange(desc(has_translated_orf), lncrna)
+
+write_csv(orf_summary, file.path(out_dir, "A1_orf_riboseq_summary.csv"))
+saveRDS(list(summary = orf_summary, gencode_hits = gencode_hits),
+        file.path(out_dir, "A1_orf_riboseq.rds"))
+
+cat("\n===============  ORF / Ribo-seq evidence (17 lncRNAs)  ===============\n")
+print(orf_summary, n = 30, width = Inf)
+cat("\nlncRNAs com >=1 ORF catalogado (nesta isoforma): ",
+    sum(orf_summary$has_translated_orf), " / 17\n", sep = "")
+```
+
+
+################################ miRNA sponges
+```{r}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(Biostrings)
+  library(httr)
+  library(jsonlite)
+})
+
+tx_fasta      <- "gencode.v43.transcripts.fa.gz"   # seu FASTA local
+use_encori_api <- TRUE
+encori_api     <- "https://rnasysu.com/encori/api/miRNATarget/"
+encori_flatdir <- "db/encori"      
+
+```
+
+Seeds for broadly expressed miRNAs
+```{r}
+mirna_panel <- tribble(
+  ~mirna,             ~seed,
+  "hsa-let-7a-5p",    "GAGGUAG",
+  "hsa-miR-21-5p",    "AGCUUAU",
+  "hsa-miR-16-5p",    "AGCAGCA",
+  "hsa-miR-26a-5p",   "UCAAGUA",
+  "hsa-miR-17-5p",    "AAAGUGC",
+  "hsa-miR-20a-5p",   "AAAGUGC",
+  "hsa-miR-29a-3p",   "AGCACCA",
+  "hsa-miR-92a-3p",   "AUUGCAC",
+  "hsa-miR-93-5p",    "AAAGUGC",
+  "hsa-miR-103a-3p",  "GCAGCAU",
+  "hsa-miR-107",      "GCAGCAU",
+  "hsa-miR-27a-3p",   "UCACAGU",
+  "hsa-miR-24-3p",    "GGCUCAG",
+  "hsa-miR-30a-5p",   "GUAAACA",
+  "hsa-miR-125b-5p",  "CCCUGAG",
+  "hsa-miR-9-5p",     "CUUUGGU",
+  "hsa-miR-155-5p",   "UAAUGCU",
+  "hsa-miR-221-3p",   "GCUACAU",
+  "hsa-miR-222-3p",   "CUACAUC",
+  "hsa-miR-19b-3p",   "GUGCAAA",
+  "hsa-miR-200c-3p",  "AAUACUG",
+  "hsa-miR-141-3p",   "AACACUG",
+  "hsa-miR-7-5p",     "GGAAGAC",
+  "hsa-miR-34a-5p",   "GGCAGUG"
+) %>%
+  mutate(seed_dna = chartr("U", "T", seed),
+         site7 = as.character(reverseComplement(DNAStringSet(seed_dna))))
+```
+
+Sequences of my lncRNAs
+```{r}
+stopifnot(file.exists(tx_fasta))
+fa  <- readDNAStringSet(tx_fasta)
+hdr <- tibble(header = names(fa)) %>%
+  mutate(enst      = str_extract(header, "ENST[0-9]+\\.?[0-9]*"),
+         enst_base = str_remove(enst, "\\.\\d+$"))
+
+seq_tbl <- lnc17 %>%
+  left_join(hdr %>% mutate(idx = row_number()), by = "enst_base") %>%
+  filter(!is.na(idx))
+
+missing_seq <- setdiff(lnc17$lncrna, seq_tbl$lncrna)
+if (length(missing_seq) > 0)
+  message("  sem sequencia no FASTA: ", paste(missing_seq, collapse = ", "))
+
+# DNAStringSet nomeado por lncRNA, na ordem de lnc17
+seq_set <- fa[seq_tbl$idx]
+names(seq_set) <- seq_tbl$lncrna
+```
+
+scan isoform
+```{r}
+# conta sítios (7mer-m8) de cada miRNA do painel na sequência madura.
+# Reporta: total de sítios, nº de miRNAs distintos com >=1 sítio, densidade/kb.
+mre_scan <- map_dfr(names(seq_set), function(nm) {
+  s   <- as.character(seq_set[[nm]])
+  len <- nchar(s)
+  per_mir <- map_int(mirna_panel$site7, ~ str_count(s, fixed(.x)))
+  tibble(
+    lncrna = nm,
+    tx_len = len,
+    mre_sites_total = sum(per_mir),
+    mre_mirnas_with_site = sum(per_mir > 0),
+    mre_density_per_kb = round(1000 * sum(per_mir) / len, 2)
+  )
+})
+
+# detalhe por miRNA (pra tabela suplementar / inspeção)
+mre_detail <- map_dfr(names(seq_set), function(nm) {
+  s <- as.character(seq_set[[nm]])
+  tibble(lncrna = nm,
+         mirna = mirna_panel$mirna,
+         site7 = mirna_panel$site7,
+         n_sites = map_int(mirna_panel$site7, ~ str_count(s, fixed(.x)))) %>%
+    filter(n_sites > 0)
+})
+```
+
+Encori
+```{r}
+encori_fetch <- function(gene_symbol) {
+  if (!use_encori_api) {
+    f <- file.path(encori_flatdir, paste0(gene_symbol, ".txt"))
+    if (!file.exists(f)) return(NULL)
+    return(readr::read_tsv(f, comment = "#", show_col_types = FALSE))
+  }
+  q <- list(assembly = "hg38", geneType = "lncRNA", miRNA = "all",
+            clipExpNum = 1, degraExpNum = 0, pancancerNum = 0,
+            programNum = 1, program = "None",
+            target = gene_symbol, cellType = "all")
+  resp <- tryCatch(httr::GET(encori_api, query = q, httr::timeout(40)),
+                   error = function(e) NULL)
+  if (is.null(resp) || httr::status_code(resp) != 200) return(NULL)
+  txt <- httr::content(resp, as = "text", encoding = "UTF-8")
+  tryCatch(readr::read_tsv(txt, comment = "#", show_col_types = FALSE),
+           error = function(e) NULL)
+}
+
+encori_curated <- map_dfr(lnc17$lncrna, function(sym) {
+  df <- encori_fetch(sym)
+  Sys.sleep(0.5)   # educado com a API
+  if (is.null(df) || nrow(df) == 0)
+    return(tibble(lncrna = sym, encori_mirna_n = 0L))
+  mir_col <- names(df)[str_detect(names(df), regex("miRNA", TRUE))][1]
+  tibble(lncrna = sym, encori_mirna_n = dplyr::n_distinct(df[[mir_col]]))
+})
+```
+
+summary and output
+```{r}
+mirna_summary <- lnc17 %>% dplyr::select(lncrna, enst, ensg) %>%
+  left_join(mre_scan,       by = "lncrna") %>%
+  left_join(encori_curated, by = "lncrna") %>%
+  mutate(encori_mirna_n = coalesce(encori_mirna_n, 0L),
+         has_curated_mirna = encori_mirna_n > 0) %>%
+  arrange(desc(encori_mirna_n), desc(mre_sites_total))
+
+dir.create("R2C2_out", showWarnings = FALSE, recursive = TRUE)
+write_csv(mirna_summary, "R2C2_out/A2_mirna_sponge_summary.csv")
+write_csv(mre_detail,    "R2C2_out/A2_mirna_MRE_detail.csv")
+saveRDS(list(summary = mirna_summary, mre_detail = mre_detail,
+             encori = encori_curated, mirna_panel = mirna_panel),
+        "R2C2_out/A2_mirna_sponge.rds")
+
+cat("\n============  miRNA sponge / ceRNA (17 lncRNAs)  ============\n")
+print(mirna_summary, n = 30, width = Inf)
+cat("\nlncRNAs com interacao miRNA curada (ENCORI): ",
+    sum(mirna_summary$has_curated_mirna), " / 17\n", sep = "")
+```
+
+##################
+#
+Complementary/Homology of targets
+```{r}
+targets <- readRDS("all_corr_results_f.rds")   # ajusta o caminho/nome
+names(targets)
+head(targets, 3)
+```
+
+sig targets
+```{r}
+nrow(final_targets)
+names(final_targets)
+final_targets %>% count(target_transgene_name) %>% print(n = 30)
+
+active6 <- c("DANCR","FENDRR","LINC00667","LINC00847","LNCPRESS1","PNKY")
+
+pairs <- final_targets %>%
+  filter(target_transgene_name %in% active6) %>%
+  transmute(lncrna    = target_transgene_name,
+            target_tx = transcript_name_trgt_RNA,
+            target_id = transcript_id) %>%
+  distinct()
+
+nrow(pairs)                        # ~78
+setdiff(active6, names(seq_set))   # tem que ser character(0)
+```
+```{r}
+get_seq_by_enst <- function(enst) {
+  eb  <- str_remove(enst, "\\.\\d+$")
+  idx <- which(hdr$enst_base == eb)
+  if (length(idx) == 0) NULL else fa[[idx[1]]]
+}
+get_seq_by_txname <- function(tx_name) {
+  idx <- which(hdr$tx_name == tx_name)
+  if (length(idx) == 0) NULL else fa[[idx[1]]]
+}
+
+# --- checagem ---
+c(lnc17 = exists("lnc17"), seq_set = exists("seq_set"),
+  fa = exists("fa"), get_seq_by_enst = exists("get_seq_by_enst"))
+setdiff(active6, names(seq_set))   # tem que ser character(0)
+```
+run
+```{r}
+if (!requireNamespace("pwalign", quietly = TRUE))
+  BiocManager::install("pwalign")
+library(pwalign)
+
+submat <- pwalign::nucleotideSubstitutionMatrix(match = 1, mismatch = -1, baseOnly = TRUE)
+
+score_pair <- function(qseq, sseq) {
+  if (is.null(qseq) || is.null(sseq)) return(NULL)
+  a_s <- pwalign::pairwiseAlignment(qseq, sseq, type = "local",
+           substitutionMatrix = submat, gapOpening = 5, gapExtension = 2)
+  a_a <- pwalign::pairwiseAlignment(qseq, reverseComplement(sseq), type = "local",
+           substitutionMatrix = submat, gapOpening = 5, gapExtension = 2)
+  tibble(
+    sense_score = pwalign::score(a_s), sense_pid = pwalign::pid(a_s),
+    sense_len   = nchar(pwalign::alignedPattern(a_s)),
+    anti_score  = pwalign::score(a_a), anti_pid  = pwalign::pid(a_a),
+    anti_len    = nchar(pwalign::alignedPattern(a_a))
+  )
+}
+
+homology_res <- map_dfr(seq_len(nrow(pairs)), function(i) {
+  qseq <- seq_set[[pairs$lncrna[i]]]
+  sseq <- get_seq_by_enst(pairs$target_id[i])
+  if (is.null(sseq)) sseq <- get_seq_by_txname(pairs$target_tx[i])
+  sc <- score_pair(qseq, sseq)
+  if (is.null(sc)) return(NULL)
+  bind_cols(tibble(lncrna = pairs$lncrna[i], target = pairs$target_tx[i]), sc)
+}) %>%
+  mutate(best_score = pmax(sense_score, anti_score),
+         best_pid   = if_else(sense_score >= anti_score, sense_pid, anti_pid),
+         best_len   = if_else(sense_score >= anti_score, sense_len, anti_len),
+         best_dir   = if_else(sense_score >= anti_score, "sense", "antisense"),
+         notable    = best_len >= 20 & best_pid >= 80)
+
+homology_summary <- homology_res %>%
+  group_by(lncrna) %>%
+  summarise(n_targets = n(), n_notable = sum(notable, na.rm = TRUE),
+            max_best_len = max(best_len), max_best_pid = round(max(best_pid),1),
+            .groups = "drop")
+
+write_csv(homology_res,     "R2C2_out/A3_homology_pairs.csv")
+write_csv(homology_summary, "R2C2_out/A3_homology_summary.csv")
+
+homology_res %>%
+  filter(notable) %>%
+  arrange(desc(best_len)) %>%
+  dplyr::select(lncrna, target, best_dir, best_len, best_pid, best_score) %>%
+  print(n = 30)
+
+# 1) os dois hits grandes sao repeat de baixa complexidade?
+big <- homology_res %>% filter(best_len >= 100)
+big %>% dplyr::select(lncrna, target, best_dir, best_len, best_pid)
+
+# 2) DANCR: XACT e LRRK1 estao entre os ALVOS SIGNIFICATIVOS de DANCR?
+final_targets %>%
+  filter(target_transgene_name == "DANCR") %>%
+  dplyr::select(transcript_name_trgt_RNA, pearson_r, pearson_padj_BH)
+
+# reconta "notable" com limiar mais rigoroso (>=50 nt), que e o que importa
+homology_res %>%
+  mutate(notable_strict = best_len >= 50 & best_pid >= 80) %>%
+  summarise(n_pairs = n(),
+            n_notable_20nt = sum(notable),
+            n_notable_50nt = sum(notable_strict))
+```
+
+Save the summary
+```{r}
+library(tidyverse)
+
+orf   <- read_csv("R2C2_out/A1_orf_riboseq_summary.csv", show_col_types = FALSE)
+mirna <- read_csv("R2C2_out/A2_mirna_sponge_summary.csv", show_col_types = FALSE)
+homol <- read_csv("R2C2_out/A3_homology_summary.csv",    show_col_types = FALSE)
+
+# --- ORF: presença + nº + classe ---
+orf_t <- orf %>%
+  transmute(lncrna, enst, ensg,
+            orf_n     = gencode_orf_n,
+            orf_types = gencode_orf_types,
+            orf_exons = if ("gencode_exons" %in% names(orf)) gencode_exons else NA_character_,
+            has_orf   = has_translated_orf)
+
+# --- miRNA: curado + intrínseco ---
+mirna_t <- mirna %>%
+  transmute(lncrna,
+            encori_mirna_n,
+            mre_sites_total,
+            mre_density_per_kb,
+            max_sites_one_mirna = if ("max_sites_one_mirna" %in% names(mirna))
+                                    max_sites_one_mirna else NA_integer_,
+            has_curated_mirna)
+
+# --- homologia: só os 6 ativos têm; resto fica NA/"not tested" ---
+homol_t <- homol %>%
+  transmute(lncrna,
+            homol_targets  = n_targets,
+            homol_notable  = n_notable,
+            homol_max_len  = max_best_len,
+            homol_max_pid  = max_best_pid)
+
+# --- merge nos 17 ---
+supp <- orf_t %>%
+  left_join(mirna_t, by = "lncrna") %>%
+  left_join(homol_t, by = "lncrna") %>%
+  mutate(
+    active_trans_lncRNA = lncrna %in% c("DANCR","FENDRR","LINC00667",
+                                        "LINC00847","LNCPRESS1","PNKY"),
+    homology_tested = active_trans_lncRNA,
+    across(c(homol_targets, homol_notable, homol_max_len, homol_max_pid),
+           ~ if_else(active_trans_lncRNA, ., NA_real_))
+  ) %>%
+  arrange(desc(active_trans_lncRNA), lncrna)
+
+write_csv(supp, "R2C2_out/SuppTable_R2C2_mechanisms.csv")
+print(supp, width = Inf, n = 30)
+```
+
