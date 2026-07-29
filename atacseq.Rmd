@@ -1,0 +1,636 @@
+---
+title: "all atac"
+author: "ML"
+date: "2025_08_08"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+# Load libraries
+```{r}
+library(rtracklayer)
+library(tidyverse)
+library(GenomicRanges)
+library(DESeq2)
+library(ggrepel)
+library(ComplexHeatmap)
+library(circlize)
+library(seriation)
+library(rtracklayer)
+```
+
+# Load consensus peak annotation, featureCounts output, and gene annotation
+```{r}
+setwd("/scratch/Shares/rinn/ML/ATAC_FULL_MODEL")
+
+peak_annotation <- read.table("/scratch/Shares/rinn/lincxpress/all_atac/results_broad/bwa/merged_library/macs2/broad_peak/consensus/consensus_peaks.mLb.clN.annotatePeaks.txt", sep = "\t", header = T)
+colnames(peak_annotation)[1] <- "interval_id"
+
+peak_counts <- read.table("/scratch/Shares/rinn/lincxpress/all_atac/results_broad/bwa/merged_library/macs2/broad_peak/consensus/consensus_peaks.mLb.clN.featureCounts.txt", sep = "\t", header = TRUE, skip = 1)
+# Distribution of counts across samples
+print(summary(peak_counts[, -c(1:6)])) 
+
+genes <- rtracklayer::import(file.path("/scratch/Shares/rinn/ML/hipsc_timecourse_GFP/genomes/gencode.v38.annotation.gene.gtf"))
+names(genes) <- genes$gene_id
+# Remove pseudogenes
+genes <- genes[!grepl("pseudogene", genes$gene_type), ]
+ 
+save(peak_annotation, peak_counts, genes, file = "/scratch/Shares/rinn/ML/ATAC_FULL_MODEL/results/all_atac_merged_library_broad.RData")
+```
+
+#Clean up and factor peak counts
+```{r}
+colnames(peak_counts) <- gsub(".mLb.clN.sorted.bam","",colnames(peak_counts))
+rownames(peak_counts) <- peak_counts$Geneid
+peak_counts <- peak_counts[, 7:ncol(peak_counts), drop = FALSE] %>% as.matrix()
+
+colnames(peak_counts) <- sub("^LINC00667\\.", "LINC00667_", colnames(peak_counts))
+colnames(peak_counts) <- sub("^LINCROR\\.", "LINCROR_", colnames(peak_counts))
+colnames(peak_counts) <- sub("^FENDRR\\.", "FENDRR_", colnames(peak_counts))
+
+col_data <- data.frame("sample_name" = colnames(peak_counts)) 
+
+split_values <- strsplit(col_data$sample_name, "_")
+
+View(split_values)
+
+condition_values <- sapply(split_values, function(x) x[[1]])
+time_values <- sapply(split_values, function(x) x[[2]])
+replicate_values <- sapply(split_values, function(x) x[[3]])
+
+col_data$time <- time_values
+col_data$condition <- condition_values
+col_data$replicate <- replicate_values
+
+col_data$timepoint <- factor(col_data$time, levels = c("0h", "0.5h", "1h", "1.5h", "2h", "2.5h"))
+levels(col_data$timepoint)
+```
+
+```{r}
+# Store results in a list
+dds_list <- list()
+res_list <- list()
+
+# Get unique conditions
+conditions <- unique(col_data$condition)
+
+# Loop through each condition
+for (cond in conditions) {
+  message("Processing condition: ", cond)
+  
+  # Subset col_data and counts
+  sub_col_data <- col_data[col_data$condition == cond, ]
+  sub_counts <- peak_counts[, sub_col_data$sample_name]
+  
+  # Ensure time is a factor with consistent levels
+  sub_col_data$time <- factor(as.character(sub_col_data$time), 
+                              levels = c("0h", "0.5h", "1h", "1.5h", "2h", "2.5h"))
+levels(col_data$time)
+  
+  # Build DESeq2 object
+  dds <- DESeqDataSetFromMatrix(countData = sub_counts,
+                                colData = sub_col_data,
+                                design = ~ time)
+  
+  # Run DESeq2 with LRT test
+  dds <- DESeq(dds, test = "LRT", reduced = ~1)
+  
+  # Store full DESeq object and results
+  dds_list[[cond]] <- dds
+  res_list[[cond]] <- results(dds)
+}
+save(dds_list, col_data, file = "/scratch/Shares/rinn/ML/ATAC_FULL_MODEL/results/all_atac_dds.RData")
+
+# Create final dataframe to store all results
+all_results_df <- data.frame()
+
+# Loop through each condition
+for (cond in names(dds_list)) {
+  dds <- dds_list[[cond]]
+  
+  # Get all result names (skip intercept)
+  res_names <- resultsNames(dds)[-1]
+  
+  for (res_name in res_names) {
+    # Extract results
+    res <- results(dds, name = res_name)
+    
+    # Convert to data frame, join with gene annotations
+    tmp_df <- as.data.frame(res) %>%
+      rownames_to_column("interval_id") %>%
+      mutate(condition  = cond,
+             result_name = res_name,
+             timepoint = as.numeric(sub("time_([0-9\\.]+)h?_vs_0h?", "\\1", res_name))) %>%
+      merge(peak_annotation %>% 
+            dplyr::select(interval_id, Gene.Name, Nearest.PromoterID, 
+                          Distance.to.TSS, Chr, Start, End)) %>% 
+    unite(ucsc_coord, Chr, Start, remove = FALSE, sep = ":") %>%
+    unite(ucsc_coord, ucsc_coord, End, sep = "-", remove = FALSE)
+    
+    # Append
+    all_results_df <- bind_rows(all_results_df, tmp_df)
+  }
+}
+save(all_results_df, col_data, file = "/scratch/Shares/rinn/ML/ATAC_FULL_MODEL/results/all_atac_res_df.RData")
+
+# Loop through each condition
+for (cond in names(dds_list)) {
+  dds <- dds_list[[cond]]
+  
+  # Get all result names (skip intercept)
+  res_names <- resultsNames(dds)[-1]
+  
+  # Temporary dataframe for this condition
+  cond_df <- data.frame()
+  
+  for (res_name in res_names) {
+    # Extract results
+    res <- results(dds, name = res_name)
+    
+    tmp_df <- as.data.frame(res) %>%
+      rownames_to_column("interval_id") %>%
+      mutate(condition  = cond,
+             result_name = res_name,
+             timepoint = as.numeric(sub("time_([0-9\\.]+)h?_vs_0h?", "\\1", res_name))) %>%
+      merge(peak_annotation %>% 
+            dplyr::select(interval_id, Gene.Name, Nearest.PromoterID, 
+                          Distance.to.TSS, Chr, Start, End)) %>% 
+    unite(ucsc_coord, Chr, Start, remove = FALSE, sep = ":") %>%
+    unite(ucsc_coord, ucsc_coord, End, sep = "-", remove = FALSE)
+    
+    cond_df <- bind_rows(cond_df, tmp_df)
+  }
+  
+  # Assign dataframe to a variable named after the condition
+  assign(paste0(cond, "_results_df"), cond_df)
+}
+
+# Find all variables ending in _results_df
+vars_to_save <- ls(pattern = "_results_df$")
+
+# Save them into one RData file
+save(col_data, list = vars_to_save, file = "all_results_df_seperated.RData")
+```
+
+```{r}
+# Step 1: Filter padj ≤ 0.01
+filtered_df <- all_results_df %>%
+  filter(padj <= 0.05 & baseMean >= 100)
+
+# Step 2: Compute max FC per gene per condition
+maxfc_df <- filtered_df %>%
+  group_by(condition, interval_id) %>%
+  summarize(
+    max_fc = log2FoldChange[which.max(abs(log2FoldChange))],
+    .groups = "drop"
+  )
+
+# Step 3: Join and filter for max_fc ≥ 0.58
+filtered_df <- filtered_df %>%
+  left_join(maxfc_df, by = c("condition", "interval_id")) %>%
+  filter(max_fc >= 0.58 | max_fc <= -0.58)
+
+# Step 4: Mark up/down direction
+filtered_df <- filtered_df %>%
+  mutate(
+    up = log2FoldChange > 0,
+    down = log2FoldChange < 0 
+  )
+
+# Step 5: Use only late timepoints to determine consistent genes
+valid_time_points <- c(0.5, 1, 1.5, 2, 2.5)
+
+trend_summary <- filtered_df %>%
+  filter(timepoint %in% valid_time_points) %>%
+  group_by(condition, interval_id) %>%
+  summarize(
+    up_count = sum(up, na.rm = TRUE),
+    down_count = sum(down, na.rm = TRUE),
+    total_comparisons = n(),
+    .groups = "drop"
+  ) %>%
+  filter(total_comparisons == length(valid_time_points)) %>%
+  filter(up_count >= 1 | down_count >= 1)
+
+gene_dominant_conditions <- trend_summary %>%
+  # 计算每个基因在多少condition下上调/下调
+  group_by(interval_id) %>%
+  summarise(
+    n_up = sum(up_count > down_count),    # 上调的condition数量
+    n_down = sum(down_count > up_count),  # 下调的condition数量
+    dominant_direction = ifelse(n_up > n_down, "up", "down"),  # 主导方向
+    dominant_conditions = ifelse(
+      n_up > n_down,
+      paste(condition[up_count > down_count], collapse = ", "),  # 上调的conditions
+      paste(condition[down_count > up_count], collapse = ", ")  # 下调的conditions
+    ),
+    .groups = "drop"
+  ) %>%
+  # 只保留主导方向的conditions（如果n_up == n_down，默认选"up"）
+  filter(n_up != n_down)  # 可选：排除平局的情况
+
+expanded_dominant <- gene_dominant_conditions %>%
+  separate_rows(dominant_conditions, sep = ", ") %>%
+  rename(condition = dominant_conditions) %>%
+  select(interval_id, condition, dominant_direction)
+
+final_sig_genes <- filtered_df %>%
+  inner_join(expanded_dominant, by = c("interval_id", "condition")) %>%
+  filter(
+    (dominant_direction == "up" & up == TRUE) |
+    (dominant_direction == "down" & down == TRUE)
+  ) %>%
+  select(-dominant_direction)
+
+final_sig_genes <- filtered_df %>%
+  semi_join(final_sig_genes, by = c("interval_id", "condition"))
+print(length(unique(final_sig_genes$interval_id)))
+final_sig_genes <- final_sig_genes %>%
+  left_join(gene_dominant_conditions, by = "interval_id") %>%
+  select(-c(dominant_direction, dominant_conditions))
+
+print(unique(col_data$condition))
+
+sig_peaks_13_to_19 <- final_sig_genes %>%
+  filter(n_up >=13 | n_down >= 13)
+print(length(unique(sig_peaks_13_to_19$interval_id)))
+
+# Comprehensive summary
+filtered_df %>% 
+  group_by(condition) %>% 
+  summarise(
+    n_rows = n(),
+    n_unique_intervals = n_distinct(interval_id)
+  )
+```
+
+```{r}
+# Prepare log2FC data - add missing 0 timepoint with log2FC=0
+log2fc_heatmap_data <- filtered_df %>%
+  # Convert timepoint to character if it's numeric
+  mutate(timepoint = as.character(timepoint)) %>%
+  # First get all unique gene-condition combinations
+  distinct(condition, interval_id) %>%
+  # Cross with required timepoints (as character)
+  crossing(timepoint = c("0", "0.5", "1", "1.5", "2", "2.5")) %>%
+  # Join back with original data
+  left_join(
+    filtered_df %>% mutate(timepoint = as.character(timepoint)), 
+    by = c("condition", "interval_id", "timepoint")
+  ) %>%
+  # Set log2FC to 0 for timepoint 0 (whether originally present or not)
+  mutate(log2FoldChange = ifelse(timepoint == "0", 0, log2FoldChange)) %>%
+  # Remove any NA values that might exist for other timepoints
+  filter(!is.na(log2FoldChange)) %>%
+  # Convert timepoint to factor with specified levels
+  mutate(timepoint = factor(timepoint, levels = c("0", "0.5", "1", "1.5", "2", "2.5")))
+
+# Generate separate heatmaps for each condition
+for(current_condition in unique(log2fc_heatmap_data$condition)) {
+  p <- log2fc_heatmap_data %>%
+    filter(condition == current_condition) %>%
+    ggplot(aes(x = timepoint, y = reorder(interval_id, log2FoldChange), fill = log2FoldChange)) +
+    geom_tile(color = NA, linewidth = 0) +
+    scale_fill_gradientn(
+    colours = c("#313695", "#4575b4", "#74add1", "#e0f3f8", "#f7f7f7", "#fdae61", "#f46d43", "#d73027", "#a50026"),
+    values = scales::rescale(c(-1, -0.75, -0.5, -0.25, 0, 0.25, 0.5, 0.75, 1)),
+    limits = c(-1, 1),
+    name = "log2FC",
+    na.value = "grey90",
+    oob = scales::squish,
+    guide = guide_colorbar(
+    barheight = unit(3, "cm"),
+    barwidth = unit(0.5, "cm")))+
+    theme_minimal(base_size = 10) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      axis.text.y = element_blank(),
+      axis.ticks.y = element_blank(),
+      panel.grid = element_blank(),
+      plot.title = element_text(face = "bold")
+    ) +
+    labs(
+      title = paste("log2FC by Time -", current_condition),
+      x = "Time (h)",
+      y = "Peaks"
+    ) +
+    scale_x_discrete(expand = c(0, 0)) +
+    scale_y_discrete(expand = c(0, 0))
+  
+  print(p)
+  output_dir <- "/scratch/Shares/rinn/ML/ATAC_FULL_MODEL/figures/"
+ggsave(paste0(output_dir, "heatmap_log2fc_", current_condition, ".pdf"), 
+       width = 8, height = 10)
+}
+
+```
+
+
+
+```{r}
+stopifnot(all(colnames(HAGLR_peak_counts) == col_data$original$sample_name))
+
+HAGLR_atac_dds <- DESeqDataSetFromMatrix(countData = HAGLR_peak_counts, 
+                                            colData = col_data, 
+                                            design = ~ timepoint + transgene + timepoint : transgene)
+
+HAGLR_atac_dds <- DESeq(HAGLR_atac_dds, test = "LRT", reduced = ~ timepoint + transgene)
+
+
+resultsNames(HAGLR_atac_dds)
+
+HAGLR_atac_res <- resultsNames(HAGLR_atac_dds)
+HAGLR_atac_res <- HAGLR_atac_res[grepl("transgeneHAGLR", HAGLR_atac_res)]
+  
+HAGLR_atac_lfc <- lapply(HAGLR_atac_res, function(x) {
+    results(HAGLR_atac_dds, name = x) %>%
+      as.data.frame() %>%
+      rownames_to_column("interval_id") %>% 
+      mutate(result_name = x,
+             timepoint = as.numeric(sub("timepoint(\\d+\\.?\\d*)h.transgeneHAGLR", "\\1", result_name)))
+  }) %>% bind_rows() %>% merge(peak_annotation %>% 
+            dplyr::select(interval_id, Gene.Name, Nearest.PromoterID, 
+                          Distance.to.TSS, Chr, Start, End)) %>% 
+    unite(ucsc_coord, Chr, Start, remove = FALSE, sep = ":") %>%
+    unite(ucsc_coord, ucsc_coord, End, sep = "-", remove = FALSE)
+
+  names(HAGLR_atac_lfc)[10] <- "gene_name"
+  names(HAGLR_atac_lfc)[11] <- "gene_id"
+
+#hist(HAGLR_atac_lfc$padj)
+
+length(unique(HAGLR_atac_lfc$interval_id))
+#344499
+ HAGLR_atac_lfc<- HAGLR_atac_lfc %>% 
+  filter(padj <= 0.01)
+  print(length(unique(HAGLR_atac_lfc$interval_id)))
+  #12886
+  save(HAGLR_atac_dds, HAGLR_atac_lfc, file = "/scratch/Shares/rinn/ML/ATAC_FULL_MODEL/HAGLR/results/broad_HAGLR_timepoint_atac_dds.RData")
+```
+
+```{r}
+# Calculate the maximum fold-change in any one timepoint
+  HAGLR_atac_maxlfc <- HAGLR_atac_lfc %>%
+    group_by(interval_id) %>%
+    summarize(max_fc = max(abs(log2FoldChange))) 
+  
+# merge max lfc into dataframe
+  HAGLR_atac_lfc <- HAGLR_atac_lfc %>%
+    left_join(HAGLR_atac_maxlfc)
+  
+# Calculate the sum_fc
+  HAGLR_atac_lfc_sum_fc <- HAGLR_atac_lfc %>%
+    group_by(interval_id) %>%
+    summarize(sum_fc = sum(log2FoldChange)) 
+  
+# merge sum_fc into dataframe
+  HAGLR_atac_lfc <- HAGLR_atac_lfc %>%
+    left_join(HAGLR_atac_lfc_sum_fc)
+
+#calculate zscore
+  HAGLR_atac_lfc <- HAGLR_atac_lfc %>%
+  mutate(zscore = as.numeric(scale(max_fc, center = TRUE, scale = TRUE))) 
+
+#check log2FC at zscore=0.05
+  find_zscore <- HAGLR_atac_lfc %>%
+  filter(zscore < 2)
+  
+largest_max_fc <- max(find_zscore$max_fc, na.rm = TRUE)
+
+print(largest_max_fc)
+#0.71  
+HAGLR_atac_sig <- HAGLR_atac_lfc %>%
+  filter(max_fc >= 0.58)
+
+length(unique(HAGLR_atac_sig$interval_id))
+  #5667
+ 
+save(HAGLR_atac_dds, HAGLR_atac_lfc, HAGLR_atac_sig, file = "/scratch/Shares/rinn/ML/ATAC_FULL_MODEL/HAGLR/results/broad_HAGLR_timepoint_atac_sig.RData")
+```
+
+```{r}
+load("/scratch/Shares/rinn/ML/RNAseq_FULL_MODEL/HAGLR/results/HAGLR_rnaseq_list_for_atacseq.RData")
+
+
+length(unique(HAGLR_trend_sig_filtered$gene_name))
+#192
+
+peak_annotation_gr <- GRanges(seqnames = peak_annotation$Chr,
+                             IRanges(start = peak_annotation$Start,
+                                     end = peak_annotation$End),
+                             interval_id = peak_annotation$interval_id)
+
+sig_atac_gr <- peak_annotation_gr[peak_annotation_gr$interval_id %in% unique(HAGLR_atac_sig$interval_id)]
+
+# making a promoters GenomicRanges with promoters function
+promoters_gr <- promoters(genes, upstream = 1, downstream = 1)
+promoters_df <- promoters_gr %>% as.data.frame() %>%
+  
+  # taking all genes except processed pseudogenes
+  filter(gene_type %in% c("protein_coding", "processed_transcript", "bidirectional_promoter_lncRNA",
+                          "antisense", "lincRNA", "sense_intronic"))
+
+# finding overlaps of promoter regions in promoters_df
+promoters_gr <- promoters_gr[promoters_gr$gene_id %in%promoters_df$gene_id]
+
+# establishing peak centers building Ranges for sig atac peaks
+# divide peak by two adn connect to start point
+peak_centers <- start(sig_atac_gr) + round(width(sig_atac_gr)/2)
+sig_atac_center <- GRanges(seqnames = seqnames(sig_atac_gr),
+                           ranges = IRanges(start = peak_centers,
+                                            end = peak_centers),
+                           # naming peak
+                           interval_id = sig_atac_gr$interval_id)
+
+# setting peak to 50Kb up and downstream from peak center
+offset <- 5e4
+
+# creating 10Kb up and downstream of peak center with offset
+# NOTE if you run twice it will affet the results !!
+# Start and end are accessor functions to go into these values
+start(sig_atac_center) <- start(sig_atac_center) - offset
+end(sig_atac_center) <- end(sig_atac_center) + offset
+
+# overlaps with TSS for sig atac peak centers
+# NOTE the ordering of overlaps matters for the lines below
+peak_tss_overlaps <- findOverlaps(promoters_gr, sig_atac_center)
+
+# making Granges into data frame
+atac_df <- sig_atac_center %>% as.data.frame()
+promoters_df <- promoters_gr %>% as.data.frame()
+
+# finding a bunch of overlapping features with atac peak centers 
+# @to is atac sig GR @ from is promters GR
+overlapping_df <- atac_df[peak_tss_overlaps@to, ]
+overlapping_df$gene_id <- promoters_df$gene_id[peak_tss_overlaps@from]
+overlapping_df$gene_name <- promoters_df$gene_name[peak_tss_overlaps@from]
+overlapping_df$gene_tss <- promoters_df$start[peak_tss_overlaps@from]
+overlapping_df$gene_chr <- promoters_df$seqnames[peak_tss_overlaps@from]
+overlapping_df$gene_strand <- promoters_df$strand[peak_tss_overlaps@from]
+
+# calculating distance from TSS
+# subtracting peak center from the TSS to find distance*
+overlapping_df <- overlapping_df %>%
+  mutate(dist_to_tss = gene_tss - (start+offset),
+         dist_to_peak = (start+offset) - gene_tss)
+
+# some distances are positive and negative depending on up or down stream
+# fixing to plot so they are all in the same 
+# Flip the minus strand differences so that it's a TSS centric view
+overlapping_df[overlapping_df$gene_strand == "-", "dist_to_peak"] <- -1* overlapping_df[overlapping_df$gene_strand == "-", "dist_to_peak"] 
+
+# finding overlaps with sig genes in short combined
+overlapping_df$deg <- overlapping_df$gene_name %in%HAGLR_trend_sig_filtered$gene_name
+length(unique(overlapping_df$interval_id))
+
+overlapping_df_filtered <- 
+  overlapping_df %>% 
+  filter(deg == TRUE)
+length(unique(overlapping_df_filtered$gene_name))
+#79
+length(unique(overlapping_df_filtered$interval_id))
+#106
+HAGLR_atac_lfc_overlap_peaks <- 
+  HAGLR_atac_lfc %>% 
+  filter(interval_id %in% overlapping_df_filtered$interval_id)
+
+length(unique(HAGLR_atac_lfc_overlap_peaks$interval_id))
+  
+   # Ensure unique interval_id-to-gene_name mapping in overlapping_df_filtered
+overlapping_df_filtered_unique <- overlapping_df_filtered %>%
+   filter(deg == TRUE) %>%
+  group_by(interval_id) %>%
+  summarise(gene_name = paste(unique(gene_name), collapse = ";"), .groups = "drop")
+
+# Perform the join with the unique overlapping_df_filtered
+HAGLR_atac_lfc_overlap_peaks_updated <- HAGLR_atac_lfc_overlap_peaks %>%
+  left_join(overlapping_df_filtered_unique, by = "interval_id") %>%
+  mutate(gene_name = coalesce(gene_name.y, gene_name.x)) %>%
+  select(-gene_name.x, -gene_name.y)
+
+# View the updated data
+head(HAGLR_atac_lfc_overlap_peaks_updated)
+
+#change Distance.to.TSS to gr annotated dist_to_tss
+HAGLR_atac_lfc_overlap_peaks_updated <- HAGLR_atac_lfc_overlap_peaks_updated %>%
+  left_join(overlapping_df_filtered %>% select(interval_id, dist_to_tss), by = "interval_id") %>%
+  mutate(Distance.to.TSS = dist_to_tss) %>%
+  select(-dist_to_tss)  # Remove the added column if no longer needed
+
+# Create the unique_mapping with added RNA-seq trend, ATAC-seq trend, and picked_by_eye
+unique_mapping <- HAGLR_atac_lfc_overlap_peaks_updated %>%
+  distinct(sum_fc, gene_name, interval_id) %>%
+  rowwise() %>%  # Ensure row-wise operations for `case_when` involving `str_split`
+  mutate(
+    # Mark RNA-seq trend as "down" if gene_name is in HAGLR_trend_sig_down, otherwise mark as "up"
+    rna_seq_trend = case_when(
+      any(str_split(gene_name, ";")[[1]] %in% HAGLR_trend_sig_down_filtered$gene_name) ~ "down",
+      any(str_split(gene_name, ";")[[1]] %in% HAGLR_trend_sig_up_filtered$gene_name) ~ "up",
+      TRUE ~ "unknown"  # If gene_name matches neither list, mark as "unknown"
+    ),
+    
+    # Mark ATAC-seq trend based on sum_fc
+    atac_seq_trend = case_when(
+      sum_fc > 0 ~ "up",
+      sum_fc < 0 ~ "down",
+      TRUE ~ "unknown"  # If sum_fc is 0, mark as "unknown"
+    ),
+    
+    # Check if RNA-seq and ATAC-seq trends are the same
+    same_trend = case_when(
+      rna_seq_trend == atac_seq_trend ~ "same",  # If trends are the same, mark as "same"
+      TRUE ~ "different"  # Otherwise mark as "different"
+    ),
+  ) %>%
+  ungroup()  # Reset row-wise grouping
+
+
+# View the result
+head(unique_mapping)
+num_matches <- sum(unique_mapping$same_trend == "same")
+#65
+unique_mapping_match <- unique_mapping %>%
+   filter(same_trend == "same") %>%
+  group_by(interval_id)
+
+HAGLR_atac_match_peaks <- HAGLR_atac_lfc_overlap_peaks_updated %>%
+  filter(interval_id %in% unique_mapping_match$interval_id)
+write.csv(HAGLR_atac_match_peaks, file = "/scratch/Shares/rinn/ML/ATAC_FULL_MODEL/HAGLR/results/HAGLR_atac_match_peaks.csv")
+
+print(unique_mapping_match$interval_id)
+length(unique(unique_mapping_match$gene_name))
+#47
+
+HAGLR_atac_lfc_overlap_peaks_updated <- HAGLR_atac_lfc_overlap_peaks_updated %>%
+  left_join(overlapping_df_filtered %>% select(interval_id, dist_to_tss), by = "interval_id") 
+  
+save(overlapping_df, overlapping_df_filtered, HAGLR_atac_lfc_overlap_peaks, HAGLR_atac_lfc_overlap_peaks_updated, HAGLR_atac_match_peaks,file = "/scratch/Shares/rinn/ML/ATAC_FULL_MODEL/HAGLR/results/broad_HAGLR_overlappin_peaks.RData")
+
+
+```
+
+```{r}
+HAGLR_atac_dds <- estimateSizeFactors(HAGLR_atac_dds)
+all_counts<-counts(HAGLR_atac_dds, normalized=TRUE) 
+all_counts <- as.data.frame(all_counts)
+all_counts <- rownames_to_column(all_counts)
+colnames(all_counts)[colnames(all_counts) == "rowname"] <- "interval_id"
+
+#all_counts_filtered <- all_counts %>% 
+#  filter(interval_id %in% unique_mapping_match$interval_id)
+
+all_counts_filtered <- all_counts %>% 
+  filter(interval_id %in% unique_mapping$interval_id)
+
+all_counts_filtered_long <- all_counts_filtered %>%
+     pivot_longer(
+       cols = -interval_id,  # Assuming 'gene_id' or a similar identifier column exists
+       names_to = c("condition", "time_point", "replicate"),
+       names_pattern = "^(HAGLR|GFP)[._](\\d+(?:\\.\\d+)?h?)[._]REP(\\d+)$",
+       values_to = "counts"
+    ) %>%
+     mutate(
+        time_point = as.numeric(gsub("h", "", time_point)), 
+        replicate = as.numeric(replicate),
+        condition = ifelse(condition == "novageneGFP", "GFP", condition) 
+    )
+
+#all_counts_filtered_long <- all_counts_filtered_long %>%
+#  left_join(unique_mapping_match)
+
+#get all peak that changed not considering if it match RNAseq pattern or not
+all_counts_filtered_long <- all_counts_filtered_long %>%
+  left_join(unique_mapping)
+
+ggplot(all_counts_filtered_long, aes(x = time_point, y = counts, color = condition, linetype = condition)) +
+  geom_point(alpha = 0.7) +
+  stat_summary(fun = mean, geom = "line") +
+  facet_wrap(~ gene_name + interval_id, scales = "free_y") +
+  labs(
+    x = "Time Point (h)", 
+    y = "Peak Counts", 
+    color = "Condition"
+  ) +
+  theme_minimal() +
+  scale_color_manual(values = c("HAGLR" = "darkred", "GFP" = "blue")) +
+  scale_linetype_manual(values = c("HAGLR" = "solid", "GFP" = "dashed")) +
+  scale_x_continuous(breaks = unique(all_counts_filtered_long$time_point)) +
+  theme(
+    aspect.ratio = 1,
+    strip.text = element_text(size = 12)
+  )
+
+#ggsave(
+#  path = "/scratch/Shares/rinn/ML/ATAC_FULL_MODEL/HAGLR/figures/",
+#  filename = "HAGLR_GFP_sig_peak_counts_match.pdf",
+#  height = 20, width = 30, limitsize = FALSE
+#)
+
+ggsave(
+  path = "/scratch/Shares/rinn/ML/ATAC_FULL_MODEL/HAGLR/figures/",
+  filename = "HAGLR_GFP_sig_peak_counts.pdf",
+  height = 40, width = 30, limitsize = FALSE
+)
+```
+
