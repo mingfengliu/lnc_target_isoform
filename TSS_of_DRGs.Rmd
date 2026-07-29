@@ -1,0 +1,70 @@
+---
+title: "TSS_profile_plot_of_DRGs"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+library(dplyr)
+library(GenomicRanges)
+library(EnsDb.Hsapiens.v86) 
+library(rtracklayer)
+
+
+target_genes_df <- sig_genes_21_to_28 
+target_genes_df$gene_id_clean <- gsub("\\..*", "", target_genes_df$gene_id)
+target_ids <- unique(target_genes_df$gene_id_clean)
+
+
+edb <- EnsDb.Hsapiens.v86
+
+
+genes_gr <- genes(edb, 
+                  filter = GeneIdFilter(target_ids),
+                  columns = c("gene_id", "symbol"),
+                  return.type = "GRanges")
+
+
+
+if(length(genes_gr) < length(target_ids)) {
+  missing <- setdiff(target_ids, genes_gr$gene_id)
+  print(missing)
+}
+
+missing_gene_gr <- GRanges(
+  seqnames = "X",           
+  ranges = IRanges(start = 154582307, end = 154608358), 
+  strand = "-",
+  gene_id = "ENSG00000284691",
+  symbol = "RP11-511P7.5"   
+)
+
+
+mcols(genes_gr) <- mcols(genes_gr)[, c("gene_id", "symbol")]
+genes_gr <- c(genes_gr, missing_gene_gr)
+
+
+
+
+current_levels <- seqlevels(genes_gr)
+
+
+new_levels <- paste0("chr", current_levels)
+
+
+new_levels <- gsub("chrMT", "chrM", new_levels)
+
+names(new_levels) <- current_levels
+genes_gr <- renameSeqlevels(genes_gr, new_levels)
+
+
+genes_gr <- keepStandardChromosomes(genes_gr, pruning.mode = "coarse")
+
+
+
+export(genes_gr, "CDRS_209_Ensembl_Fixed.bed", format = "bed")
+
+
+```
+
