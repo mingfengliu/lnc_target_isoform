@@ -1,0 +1,331 @@
+---
+title: "RF"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+```{r}
+# 加载必要的包
+library(DESeq2)
+library(randomForest)
+library(caret)
+library(ranger)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(purrr)
+
+# ------------------------------------------------
+# 1. 载入数据
+# ------------------------------------------------
+setwd("~/RNAseq/DOX/DOX_lnc_network")
+
+load("~/RNAseq/combined_counts_with_gene_name.RData")
+load("~/RNAseq/sig_lncRNA_18_to_24.RData")
+
+counts_matrix <- combined_counts_plus[, -665]
+rownames(counts_matrix) <- counts_matrix$gene_id
+counts_matrix <- counts_matrix[, -1]
+counts_matrix <- as.matrix(counts_matrix)
+
+lncRNAs <- unique(sig_lncRNA_18_to_24$gene_id)
+
+# ------------------------------------------------
+# 2. DESeq2 VST 转换
+# ------------------------------------------------
+dds <- DESeqDataSetFromMatrix(
+  countData = counts_matrix,
+  colData   = data.frame(row.names = colnames(counts_matrix)),
+  design    = ~ 1
+)
+vst_mat <- assay(vst(dds, blind = TRUE))
+
+# ------------------------------------------------
+# 3. 选择时间点 (0, 2, 4, 8, 16, 24, 48, 96)
+# ------------------------------------------------
+sel_samples <- grep("_(0|2|4|8|16|24|48|96)_", colnames(vst_mat), value = TRUE)
+expr <- vst_mat[, sel_samples]
+
+# ------------------------------------------------
+# 4. 选高变基因（推荐 top 3000）
+# ------------------------------------------------
+gene_var <- apply(expr, 1, var)
+top_genes <- union(lncRNAs, names(sort(gene_var, decreasing = TRUE))[1:5000])
+expr <- expr[top_genes, ]
+
+# ------------------------------------------------
+# 5. 样本信息拆解并设定时间为有序因子
+# ------------------------------------------------
+meta <- data.frame(sample = sel_samples) %>%
+  tidyr::separate(sample, into = c("cell", "time", "rep"), sep = "_") %>%
+  mutate(
+    time = factor(
+      time,
+      levels = c("0", "2", "4", "8", "16", "24", "48", "96"),
+      ordered = TRUE
+    )
+  )
+
+expr_t <- t(expr)
+```
+
+
+```{r}
+rigorous_validation <- function() {
+  set.seed(123)
+  final_results <- list()
+  performance_summary <- data.frame(
+    lncRNA = character(),
+    R2 = numeric(),
+    RMSE = numeric(),
+    best_mtry = integer(),
+    stringsAsFactors = FALSE
+  )
+  importance_list <- list()
+  all_predictions <- data.frame()  # 存储所有预测结果
+  
+  # 1. 使用5折分组CV
+  folds <- groupKFold(meta$cell, k = 5)
+  
+  # 2. 包含时间特征（基于你的成功结果）
+  total_lnc <- sum(lncRNAs %in% colnames(expr_t))
+  current_lnc <- 0
+  
+  cat("开始处理", total_lnc, "个lncRNA...\n")
+  cat("========================================\n")
+  
+  for (lnc in lncRNAs) {
+    if (!lnc %in% colnames(expr_t)) next
+    
+    current_lnc <- current_lnc + 1
+    cat("[", current_lnc, "/", total_lnc, "] 正在处理: ", lnc, "\n", sep = "")
+    
+    y <- expr_t[, lnc]
+    X <- expr_t[, setdiff(colnames(expr_t), lnc)]
+    X_time <- cbind(X, time = meta$time)
+    
+    train_control <- trainControl(
+      method = "cv",
+      index = folds,
+      savePredictions = "final",
+      verboseIter = FALSE
+    )
+    
+    rf_grid <- expand.grid(mtry = seq(50, 500, by = 50))
+    
+    rf_model <- train(
+      x = X_time,
+      y = y,
+      method = "rf",
+      trControl = train_control,
+      tuneGrid = rf_grid,
+      ntree = 500,
+      importance = TRUE  # 启用重要性计算
+    )
+    
+    # 3. 记录详细结果
+    final_results[[lnc]] <- list(
+      R2 = max(rf_model$results$Rsquared),
+      RMSE = min(rf_model$results$RMSE),
+      best_mtry = rf_model$bestTune$mtry,
+      predictions = rf_model$pred,
+      model = rf_model
+    )
+    
+    # 4. 添加到性能摘要
+    performance_summary <- rbind(performance_summary, data.frame(
+      lncRNA = lnc,
+      R2 = max(rf_model$results$Rsquared),
+      RMSE = min(rf_model$results$RMSE),
+      best_mtry = rf_model$bestTune$mtry,
+      stringsAsFactors = FALSE
+    ))
+    
+    # 5. 收集预测值和实际值
+    pred_data <- rf_model$pred
+    # 只保留最佳mtry的预测结果
+    best_mtry_pred <- pred_data[pred_data$mtry == rf_model$bestTune$mtry, ]
+    best_mtry_pred$lncRNA <- lnc
+    best_mtry_pred$obs <- y[best_mtry_pred$rowIndex]  # 实际值
+    all_predictions <- rbind(all_predictions, best_mtry_pred)
+    
+    # 6. 提取特征重要性
+ if (!is.null(rf_model$finalModel)) {
+  imp <- varImp(rf_model)$importance
+  importance_df <- data.frame(
+    lncRNA = lnc,
+    feature = rownames(imp),
+    importance = imp$Overall,
+    stringsAsFactors = FALSE
+  )
+  importance_list[[lnc]] <- importance_df
+}
+
+    
+    # 实时显示当前lncRNA的结果
+    cat("   完成: R² =", round(max(rf_model$results$Rsquared), 4), 
+        "RMSE =", round(min(rf_model$results$RMSE), 4), "\n")
+    cat("   --------------------------------------\n")
+  }
+  
+  # 7. 合并所有重要性数据
+  if (length(importance_list) > 0) {
+    all_importance <- do.call(rbind, importance_list)
+    rownames(all_importance) <- NULL
+  } else {
+    all_importance <- data.frame(
+      lncRNA = character(),
+      feature = character(),
+      importance = numeric(),
+      stringsAsFactors = FALSE
+    )
+  }
+  
+  # 8. 性能摘要排序
+  performance_summary <- performance_summary[order(-performance_summary$R2), ]
+  
+  cat("========================================\n")
+  cat("所有lncRNA处理完成！\n")
+  
+  return(list(
+    detailed_results = final_results,
+    performance_summary = performance_summary,
+    importance_df = all_importance,
+    all_predictions = all_predictions  # 包含所有预测结果
+  ))
+}
+
+# 运行并报告
+final_cv_results <- rigorous_validation()
+
+#提取importance_df用于DBN
+# 方法：从原始模型对象中重新提取%IncMSE
+extract_actual_incmse <- function(final_cv_results) {
+  all_incmse <- list()
+  
+  for (lnc in final_cv_results$performance_summary$lncRNA) {
+    if (!is.null(final_cv_results$detailed_results[[lnc]]$model$finalModel)) {
+      rf_model <- final_cv_results$detailed_results[[lnc]]$model$finalModel
+      imp_matrix <- rf_model$importance
+      
+      incmse_df <- data.frame(
+        lncRNA = lnc,
+        feature = rownames(imp_matrix),
+        IncMSE = imp_matrix[, "%IncMSE"],
+        IncNodePurity = imp_matrix[, "IncNodePurity"],
+        stringsAsFactors = FALSE
+      )
+      all_incmse[[lnc]] <- incmse_df
+    }
+  }
+  
+  # 合并所有数据
+  true_importance_df <- do.call(rbind, all_incmse)
+  rownames(true_importance_df) <- NULL
+  
+  return(true_importance_df)
+}
+
+# 提取真正的%IncMSE
+importance_df <- extract_actual_incmse(final_cv_results)
+
+# 查看结果
+cat("真正的%IncMSE数据:\n")
+head(true_importance_df)
+cat("维度:", dim(true_importance_df), "\n")
+cat("%IncMSE范围:", range(true_importance_df$IncMSE, na.rm = TRUE), "\n")
+# 生成相关性图函数
+generate_correlation_plots <- function(results) {
+  library(ggplot2)
+  library(dplyr)
+  library(patchwork)
+  
+  predictions_df <- results$all_predictions
+  performance_data <- results$performance_summary
+  
+  # 1. Overall correlation scatter plot
+  overall_cor <- cor(predictions_df$pred, predictions_df$obs, use = "complete.obs")
+  
+  p1 <- ggplot(predictions_df, aes(x = obs, y = pred)) +
+    geom_point(alpha = 0.3, linewidth = 0.5) +
+    geom_smooth(method = "lm", formula = y ~ x, se = TRUE, color = "red", linetype = "dashed") +
+    geom_abline(slope = 1, intercept = 0, color = "blue", linetype = "solid") +
+    labs(title = paste("Predicted vs Actual Values (r =", round(overall_cor, 3), ")"),
+         x = "Actual Values", y = "Predicted Values") +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5))
+  
+  # 2. R² distribution histogram (replaces old p2)
+  p2 <- ggplot(performance_data, aes(x = R2)) +
+    geom_histogram(bins = 20, fill = "skyblue", color = "black", alpha = 0.7) +
+    geom_vline(aes(xintercept = mean(R2)), color = "red", linetype = "dashed") +
+    labs(title = paste("R² Distribution (Mean =", round(mean(performance_data$R2), 3), ")"),
+         x = "R²", y = "Number of lncRNAs") +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5))
+  
+  # 3. All models with R2, RMSE, and best_mtry
+  top_lnc <- head(performance_data$lncRNA, 18)
+  top_predictions <- predictions_df[predictions_df$lncRNA %in% top_lnc, ]
+  top_predictions <- top_predictions %>%
+    left_join(performance_data[, c("lncRNA", "R2", "RMSE", "best_mtry")], by = "lncRNA")
+  
+  # Create labels with all three metrics
+  top_predictions$label <- paste0(
+    top_predictions$lncRNA, "\n",
+    "R² = ", round(top_predictions$R2, 3), " | ",
+    "RMSE = ", round(top_predictions$RMSE, 3), " | ",
+    "mtry = ", top_predictions$best_mtry
+  )
+  
+  p3 <- ggplot(top_predictions, aes(x = obs, y = pred)) +
+    geom_point(alpha = 0.6, linewidth = 0.8) +
+    geom_smooth(method = "lm", formula = y ~ x, se = FALSE, color = "red") +
+    geom_abline(slope = 1, intercept = 0, color = "blue", linetype = "dashed", alpha = 0.7) +
+    facet_wrap(~ label, scales = "free") +
+    labs(title = "All lncRNAs with Performance Metrics",
+         x = "Actual Values", y = "Predicted Values") +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5),
+          strip.text = element_text(size = 8))
+  
+  # Combine plots - p1 and p2 on top row, p3 on bottom row
+  combined_plot <- (p1 + p2) / (p3) + 
+    plot_annotation(tag_levels = 'A') &
+    theme(plot.tag = element_text(face = "bold"))
+  
+  print(combined_plot)
+  
+  return(list(
+    overall_plot = p1,
+    r2_distribution = p2,
+    top_models_plot = p3,
+    combined_plot = combined_plot
+  ))
+}
+
+# Generate correlation plots
+cat("\nGenerating correlation plots...\n")
+correlation_plots <- generate_correlation_plots(final_cv_results)
+
+# Print performance summary
+cat("\n=== Performance Summary ===\n")
+print(final_cv_results$performance_summary)
+
+# Print overall statistics
+cat("\n=== Overall Statistics ===\n")
+cat("Mean R²:", round(mean(final_cv_results$performance_summary$R2, na.rm = TRUE), 4), "\n")
+cat("Mean RMSE:", round(mean(final_cv_results$performance_summary$RMSE, na.rm = TRUE), 4), "\n")
+cat("Mean best_mtry:", round(mean(final_cv_results$performance_summary$best_mtry, na.rm = TRUE), 1), "\n")
+cat("Number of lncRNAs processed:", nrow(final_cv_results$performance_summary), "\n")
+cat("Best model (R²):", final_cv_results$performance_summary$lncRNA[1], 
+    "(R² =", round(final_cv_results$performance_summary$R2[1], 4), 
+    "RMSE =", round(final_cv_results$performance_summary$RMSE[1], 4),
+    "mtry =", final_cv_results$performance_summary$best_mtry[1], ")\n")
+
+# Save plots
+# ggsave("correlation_plots.png", correlation_plots$combined_plot, 
+#        width = 16, height = 12, dpi = 300)
+```
+
+
