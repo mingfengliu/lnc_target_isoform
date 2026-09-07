@@ -51,7 +51,7 @@ The study induces 17 individual lncRNAs (via a Tet-On/H11-safe-harbor system) in
 | `baseline_vs_induced_expression.R` | Supplementary figure comparing each transgene's baseline expression (pooled WT+GFP 0 h vs. its own 0 h) to its own maximally-induced timepoint, for all 17 lncRNA lines; also outputs a leakiness ("is 0 h already elevated over baseline") check. |
 | `sORFs_miRNAs.Rmd` | Reviewer-response analysis of alternative regulatory mechanisms for the 6 lncRNAs with confirmed trans-targets (DANCR, FENDRR, LINC00667, LINC00847, LNCPRESS1, PNKY): (1) overlap with catalogued Ribo-seq/GENCODE ORFs, (2) miRNA-sponge potential via seed-site scanning and the ENCORI/starBase CLIP database, and (3) sequence homology/complementarity between each lncRNA and its target transcripts. |
 
-## Suggested reading order
+## Suggested running order
 
 1. **`run_rnaseq_pipeline.sh` / `salmon_with_bootstrap.sh` / `run_atacseq_pipeline.sh`** — raw-read processing; run these first to generate the STAR/Salmon and ATAC-seq peak outputs consumed by everything below.
 2. **`rnaseq.Rmd`** — the gene-level story: DEG calling, the DRGS definition, and its enrichment/consistency across public datasets.
