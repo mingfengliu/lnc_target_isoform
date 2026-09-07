@@ -12,7 +12,6 @@ library(tidyr)
 library(bnlearn) 
 library(limma)
 
-# 清理旧的并行环境
 try({ stopCluster(cl) }, silent = TRUE) 
 registerDoSEQ() 
 
@@ -24,7 +23,6 @@ source("/scratch/Shares/rinn/ML/RNAseq_FULL_MODEL/combined time/RF_results/dbn_u
 # ------------------------------------------------------------------------------
 setwd("/scratch/Shares/rinn/ML/RNAseq_FULL_MODEL/combined time/RF_results")
 
-# 加载数据
 if(file.exists("/scratch/Shares/rinn/ML/RNAseq_FULL_MODEL/combined time/results/combined_counts_with_gene_name.RData")) {
   load("/scratch/Shares/rinn/ML/RNAseq_FULL_MODEL/combined time/results/combined_counts_with_gene_name.RData")
 } else { stop("Data file not found: combined_counts_with_gene_name.RData") }
@@ -37,7 +35,6 @@ if(file.exists("/scratch/Shares/rinn/ML/RNAseq_FULL_MODEL/combined time/RF_resul
   load("/scratch/Shares/rinn/ML/RNAseq_FULL_MODEL/combined time/RF_results/importance_df.RData")
 } else { stop("Data file not found: importance_df.RData") }
 
-# 数据预处理
 counts_matrix <- combined_counts_plus[, -665]
 rownames(counts_matrix) <- counts_matrix$gene_id
 counts_matrix <- counts_matrix[, -1]
@@ -60,7 +57,6 @@ top_genes <- union(lncRNAs, names(sort(gene_var, decreasing=TRUE))[1:5000])
 expr <- expr[top_genes, ]
 expr_t <- t(expr)
 
-# 分组逻辑
 set.seed(123)
 dbn_input_list_all_groups <- list()
 
@@ -76,8 +72,6 @@ for (lnc in unique(importance_df$lncRNA)) {
   
   total_genes <- length(all_predictors)
   
-  # === [关键参数] ===
-  # 你设置了 200。如果跑得慢，可以改回 100。
   group_size <- 50
   min_coverage <- 20
   
@@ -131,22 +125,16 @@ cat("Groups generated. Total groups:", length(dbn_input_list_all_groups), "\n")
 # 3. SETUP PARALLEL PROCESSING (FORK Mode)
 # ------------------------------------------------------------------------------
 
-# 优先读取 Slurm 变量
 slurm_cpus <- Sys.getenv("SLURM_CPUS_PER_TASK")
 
 if (slurm_cpus != "") {
   num_cores <- as.integer(slurm_cpus)
   cat("Detected SLURM allocation. Using", num_cores, "cores.\n")
 } else {
-  # 如果没有 Slurm，手动设置
-  # 请确保这个数字不要超过你申请的核数！
   num_cores <- 120
   cat("No SLURM allocation detected. Using manual setting:", num_cores, "cores.\n")
 }
 
-# === [关键修复] ===
-# 必须使用 type = "FORK" 来避免 'all 128 connections are in use' 报错
-# FORK 模式在 Linux HPC 上更高效，且没有连接数限制
 cl <- makeCluster(num_cores, type = "FORK", outfile = "")
 registerDoParallel(cl)
 
@@ -157,9 +145,6 @@ registerDoParallel(cl)
 log_dir <- "logs_monitor"
 if(!dir.exists(log_dir)) dir.create(log_dir)
 
-# 参数设置
-# 注意：group_size=200 配合 100次 bootstrap 计算量巨大
-# 如果发现速度慢，可以考虑将 N_BOOTSTRAP 降为 50
 N_BOOTSTRAP <- 25
 TIME_POINTS <- c(0, 2, 4, 8, 16, 24, 48, 96) 
 group_names <- names(dbn_input_list_all_groups)
@@ -175,12 +160,10 @@ cat("Bootstrap Iterations:", N_BOOTSTRAP, "\n")
 res_dir <- "results_parts"
 if(!dir.exists(res_dir)) dir.create(res_dir)
 
-# 执行并行循环
 results_list <- foreach(
   expr_mat = dbn_input_list_all_groups,
   grp_name = group_names,
   .packages = c("bnlearn", "dplyr", "tidyr", "limma", "stringr"),
-  # FORK 模式下 .export 其实是可选的，因为会复制父环境，但为了保险保留
   .export = c("run_temporal_DBN_with_bootstrap_v2", 
               "run_temporal_DBN_v2_with_groups",
               "build_robust_dynamic_bayesian_network_final",
@@ -198,11 +181,8 @@ results_list <- foreach(
   .options.RNG = 123 
 ) %dorng% {
   
-  # --- [断点续传逻辑] ---
-  # 如果这个组之前已经跑完了，直接跳过
   finished_flag <- file.path(log_dir, paste0(grp_name, ".finished"))
   if(file.exists(finished_flag)) {
-    # 返回 NULL 或者之前的占位符，最后我们会过滤掉 NULL
     return(NULL)
   }
   
@@ -210,7 +190,6 @@ results_list <- foreach(
   my_log_file <- file.path(log_dir, paste0(grp_name, ".log"))
   start_time <- Sys.time()
   
-  # 状态标记
   running_flag <- file.path(log_dir, paste0(grp_name, ".running"))
   file.create(running_flag)
   
@@ -248,18 +227,15 @@ results_list <- foreach(
              " | Duration: ", duration, " mins\n"), 
       file = my_log_file, append = TRUE)
   
-  # 切换标记
   file.remove(running_flag)
   file.create(finished_flag)
   
   return(res)
 }
 
-# 关闭集群
 stopCluster(cl)
 cat("All tasks completed.\n")
 
-# 筛选有效结果 (去掉因为断点续传跳过的 NULL)
 valid_results <- results_list[sapply(results_list, is.list)]
 save(valid_results, file = "DBN_Optimized_Results_HPC.RData")
 
@@ -269,16 +245,12 @@ save(valid_results, file = "DBN_Optimized_Results_HPC.RData")
 # ------------------------------------------------------------------------------
 cat("Starting aggregation from disk files...\n")
 
-# 1. 找到所有保存好的小文件
 result_files <- list.files("results_parts", pattern = "\\.RData$", full.names = TRUE)
 cat("Found", length(result_files), "completed group files.\n")
 
 if(length(result_files) == 0) stop("No result files found in 'results_parts'!")
 
-# 2. 循环读取并合并
-# 使用 lapply 快速读取所有文件
 all_edges_list <- lapply(result_files, function(f) {
-  # 加载 RData，它会把变量 'res' 加载到局部环境
   env <- new.env()
   load(f, envir = env)
   res <- env$res
@@ -293,12 +265,10 @@ all_edges_list <- lapply(result_files, function(f) {
   }
 })
 
-# 3. 合并大表格
 raw_network_table <- do.call(rbind, all_edges_list)
 
 cat("Raw table rows:", nrow(raw_network_table), "\n")
 
-# 4. Ensemble Voting (和之前一样)
 cat("Performing Ensemble Voting...\n")
 
 final_network_table <- raw_network_table %>%
@@ -314,6 +284,5 @@ final_network_table <- raw_network_table %>%
   filter(ensemble_score >= 0.7 | (n_groups_found >= 2 & max_group_freq >= 0.8)) %>%
   arrange(desc(ensemble_score))
 
-# 5. Save Final
 save(final_network_table, file = "Final_Robust_LncRNA_Network_Ensemble_HPC.RData")
 cat("Done.\n")
