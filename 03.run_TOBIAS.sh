@@ -4,22 +4,22 @@
 #SBATCH --error=tobias_%j.err
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=48        # 给足线程，加速合并和校正
-#SBATCH --mem=128G                # 内存给大点，ATACorrect 读大文件很吃内存
-#SBATCH --time=72:00:00           # 申请 3 天，防止任务超时被杀
-#SBATCH --partition=long          # 根据你们 HPC 的队列名修改 (如 short, long, highmem)
+#SBATCH --cpus-per-task=48       
+#SBATCH --mem=128G               
+#SBATCH --time=72:00:00        
+#SBATCH --partition=long        
 
 # ==============================================================================
-# 1. 环境与变量设置 (请修改这里！)
+# 1. Setup
 # ==============================================================================
 
-# 激活 conda 环境 (确保安装了 tobias 和 samtools)
-source ~/.bashrc  # 先加载bash配置
-conda init bash   # 初始化conda
-source ~/.bashrc  # 重新加载
-conda activate tobias_env  # 换成你的环境名
 
-# 核心路径
+source ~/.bashrc  
+conda init bash  
+source ~/.bashrc 
+conda activate tobias_env 
+
+
 BAM_DIR="/scratch/Shares/rinn/lincxpress/all_atac/results_broad/bwa/merged_library"
 OUT_DIR="/scratch/Shares/rinn/ML/ATAC_Footprint/TOBIAS_Results"
 GENOME="/scratch/Shares/rinn/ML/hipsc_timecourse_GFP/genomes/GRCh38.p13.genome.fa"
@@ -32,7 +32,7 @@ mkdir -p ${OUT_DIR}
 echo "Starting TOBIAS pipeline at $(date)"
 
 # ==============================================================================
-# 1.5 BAM文件完整性检查函数
+# 1.5 BAM Integrity check
 # ==============================================================================
 check_bam_integrity() {
     local bam_file=$1
@@ -65,11 +65,11 @@ create_valid_bam_list() {
 }
 
 # ==============================================================================
-# 2. 合并有效的BAM文件
+# 2. BAM Merge
 # ==============================================================================
 echo ">>> Step 1: Merging VALID BAM files..."
 
-# --- 处理 0h ---
+# --- 0h ---
 if [ ! -f "${OUT_DIR}/merged_0h.bam" ]; then
     create_valid_bam_list "*_0h_*.bam" "${OUT_DIR}/valid_bam_list_0h.txt"
     count_0h=$(wc -l < ${OUT_DIR}/valid_bam_list_0h.txt 2>/dev/null || echo 0)
@@ -87,7 +87,7 @@ else
     echo "Merged 0h BAM already exists. Skipping."
 fi
 
-# --- 处理 2.5h ---
+# ---2.5h ---
 if [ ! -f "${OUT_DIR}/merged_2.5h.bam" ]; then
     create_valid_bam_list "*_2.5h_*.bam" "${OUT_DIR}/valid_bam_list_2.5h.txt"
     count_25h=$(wc -l < ${OUT_DIR}/valid_bam_list_2.5h.txt 2>/dev/null || echo 0)
@@ -106,11 +106,11 @@ else
 fi
 
 # ==============================================================================
-# 3. Tn5 偏差校正 (ATACorrect)
+# 3. Tn5 ATACorrect
 # ==============================================================================
 echo ">>> Step 2: Running TOBIAS ATACorrect..."
 
-# 0h 校正
+# 0h 
 if [ ! -f "${OUT_DIR}/TOBIAS_0h/merged_0h_corrected.bw" ]; then
     echo "Running ATACorrect for 0h..."
     TOBIAS ATACorrect \
@@ -124,7 +124,7 @@ else
     echo "0h Correction already done."
 fi
 
-# 2.5h 校正
+# 2.5h
 if [ ! -f "${OUT_DIR}/TOBIAS_2.5h/merged_2.5h_corrected.bw" ]; then
     echo "Running ATACorrect for 2.5h..."
     TOBIAS ATACorrect \
@@ -140,11 +140,11 @@ else
 fi
 
 # ==============================================================================
-# 4. 计算足迹得分 (ScoreBigwig)
+# 4. ScoreBigwig
 # ==============================================================================
 echo ">>> Step 3: Running TOBIAS ScoreBigwig..."
 
-# 0h 打分
+# 0h 
 if [ ! -f "${OUT_DIR}/TOBIAS_0h/merged_0h_footprints.bw" ]; then
     echo "Running ScoreBigwig for 0h..."
     TOBIAS ScoreBigwig \
@@ -156,7 +156,7 @@ else
     echo "0h ScoreBigwig already done."
 fi
 
-# 2.5h 打分
+# 2.5h 
 if [ ! -f "${OUT_DIR}/TOBIAS_2.5h/merged_2.5h_footprints.bw" ]; then
     echo "Running ScoreBigwig for 2.5h..."
     TOBIAS ScoreBigwig \
@@ -169,7 +169,7 @@ else
 fi
 
 # ==============================================================================
-# 5. 差异结合分析 (BINDetect)
+# 5. BINDetect
 # ==============================================================================
 echo ">>> Step 4: Running TOBIAS BINDetect (Differential Footprinting)..."
 
