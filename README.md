@@ -55,7 +55,7 @@ The study induces 17 individual lncRNAs (via a Tet-On/H11-safe-harbor system) in
 
 1. **`run_rnaseq_pipeline.sh` / `salmon_with_bootstrap.sh` / `run_atacseq_pipeline.sh`** — raw-read processing; run these first to generate the STAR/Salmon and ATAC-seq peak outputs consumed by everything below.
 2. **`rnaseq.Rmd`** — the gene-level story: DEG calling, the DRGS definition, and its enrichment/consistency across public datasets.
-3. **`Transcript_level_drgs_pipeline_rmd.md`** — the transcript/isoform-resolution pipeline; reproduces the trans-target discovery and filtering steps (Figures 1–4) directly from Salmon output.
+3. **`Transcript_level_drgs_pipeline_rmd.md`** — the transcript/isoform-resolution pipeline; reproduces the trans-target discovery and filtering steps directly from Salmon output.
 4. **`RF.Rmd` → `dbn_analysis.R` (+ `dbn_utils.R`) → `ensembleDBN.Rmd`** — the RF-DBN regulatory-network pipeline, in execution order: feature selection, network inference, then ensemble aggregation/visualization.
 5. **`atacseq.Rmd` → `run_TOBIAS.sh` → `TSS_of_DRGs.Rmd` → `run_deeptools.sh`** — the chromatin-accessibility side of the analysis: peak-level dynamics, TF footprinting, and the DRGS-promoter accessibility profile.
 6. **`baseline_vs_induced_expression.R`** and **`sORFs_miRNAs.Rmd`** — supplementary and reviewer-requested analyses.
